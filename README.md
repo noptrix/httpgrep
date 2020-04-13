@@ -7,11 +7,11 @@ A python tool which scans for HTTP servers and finds given strings in URIs.
 ```
 $ httpgrep -H
 
---==[ httpfindstr ]==--
+--==[ httpgrep by nullsecurity.net ]==--
 
 usage
 
-  httpfindstr -h <args> -s <arg> [opts] | <misc>
+  httpgrep -h <args> -s <arg> [opts] | <misc>
 
 opts
 
