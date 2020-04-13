@@ -29,7 +29,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 __author__ = 'noptrix'
-__version__ = '1.0'
+__version__ = '1.0-dev'
 __copyright__ = 'santa clause'
 __license__ = '1337 h4x0r'
 
