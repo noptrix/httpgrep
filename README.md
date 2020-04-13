@@ -49,7 +49,7 @@ noptrix
 
 # License
 
-MIT
+Check docs/LICENSE.
 
 # Disclaimer
 
