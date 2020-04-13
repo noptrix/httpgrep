@@ -7,7 +7,7 @@
 #                                           /___/ team                         #
 #                                                                              #
 # httpgrep                                                                     #
-# Scans HTTP servers to find given strings in web URIs.					               #
+# Scans HTTP servers to find given strings in web URIs.                        #
 #                                                                              #
 # NOTES                                                                        #
 # quick'n'dirty code                                                           #
