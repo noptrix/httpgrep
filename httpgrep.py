@@ -29,7 +29,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 __author__ = 'noptrix'
-__version__ = '1.0'
+__version__ = '1.1'
 __copyright__ = 'santa clause'
 __license__ = 'MIT'
 
@@ -64,7 +64,7 @@ HELP = BOLD + '''usage''' + NORM + '''
   -b <bytes>        - num bytes to read from response. offset == response[0].
                       (default: 64)
   -x <threads>      - num threads for concurrent checks (default: 50)
-  -c <seconds>      - num seconds for socket timeout (default: 2.5)
+  -c <seconds>      - num seconds for socket timeout (default: 2.0)
   -i                - use case-insensitive search
   -v                - verbose mode (default: quiet)
 
@@ -83,18 +83,18 @@ opts = {
   'searchstr': '',
   'bytes': 64,
   'threads': 50,
-  'timeout': 2.5,
+  'timeout': 2.0,
   'case_in': False,
   'verbose': False,
 }
 
 
 def log(msg='', _type='normal', esc='\n'):
-  iprefix = f'{BOLD}{BLUE}[+] {NORM}'
-  gprefix = f'{BOLD}{GREEN}[*] {NORM}'
-  wprefix = f'{BOLD}{YELLOW}[!] {NORM}'
-  eprefix = f'{BOLD}{RED}[-] {NORM}'
-  vprefix = f'{BOLD} - {NORM}'
+  iprefix = f'{BOLD}{BLUE}[+]{NORM}'
+  gprefix = f'{BOLD}{GREEN}[*]{NORM}'
+  wprefix = f'{BOLD}{YELLOW}[!]{NORM}'
+  eprefix = f'{BOLD}{RED}[-]{NORM}'
+  vprefix = f'{BOLD}    >{NORM}'
 
   if _type == 'normal':
     sys.stdout.write(f'{msg}')
@@ -256,8 +256,8 @@ def main(cmdline):
 
   with ThreadPoolExecutor(opts['threads']) as exe:
     log('w00t w00t, game started', 'info')
+    session = requests.Session()
     for host in get_hosts(opts['hosts']):
-      session = requests.Session()
       url = build_url(host, opts['port'], opts['uri'], opts['ssl'])
       for string in get_strings(opts['searchstr']):
         exe.submit(scan, url, session, string, opts['bytes'], opts['timeout'],
