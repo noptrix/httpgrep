@@ -1,6 +1,7 @@
 # Description
 
-A python tool which scans for HTTP servers and finds given strings in URIs.
+A python tool which scans for HTTP servers and finds given strings in HTTP body
+and HTTP response headers.
 
 # Usage
 
