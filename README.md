@@ -6,8 +6,14 @@ A python tool which scans for HTTP servers and finds given strings in URIs.
 
 ```
 $ httpgrep -H
+    __    __  __
+   / /_  / /_/ /_____  ____ _________  ____
+  / __ \/ __/ __/ __ \/ __ `/ ___/ _ \/ __ \
+ / / / / /_/ /_/ /_/ / /_/ / /  /  __/ /_/ /
+/_/ /_/\__/\__/ .___/\__, /_/   \___/ .___/
+             /_/    /____/         /_/
 
---==[ httpgrep by nullsecurity.net ]==--
+     --== [ by nullsecurity.net ] ==--
 
 usage
 
@@ -22,12 +28,13 @@ opts
   -t                - use TLS/SSL to connect to service
   -u <URI>          - URI to search given strings in, e.g.: /foobar/, /foo.html
                       (default /)
+  -r                - do not search given strings in http response headers
   -s <string|file>  - a single string or multile strings in a file to find in
                       given URIs, e.g. 'tomcat 8', '/tmp/igot0daysforthese.txt'
   -b <bytes>        - num bytes to read from response. offset == response[0].
                       (default: 64)
   -x <threads>      - num threads for concurrent checks (default: 50)
-  -c <seconds>      - num seconds for socket timeout (default: 2.5)
+  -c <seconds>      - num seconds for socket timeout (default: 2.0)
   -i                - use case-insensitive search
   -v                - verbose mode (default: quiet)
 
