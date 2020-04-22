@@ -29,7 +29,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 __author__ = 'noptrix'
-__version__ = '1.2'
+__version__ = '1.3'
 __copyright__ = 'santa clause'
 __license__ = 'MIT'
 
@@ -68,12 +68,13 @@ HELP = BOLD + '''usage''' + NORM + '''
   -t                - use TLS/SSL to connect to service
   -u <URI>          - URI to search given strings in, e.g.: /foobar/, /foo.html
                       (default /)
-  -r                - do not search given strings in http response headers
   -s <string|file>  - a single string or multile strings in a file to find in
-                      given URIs, e.g. 'tomcat 8', '/tmp/igot0daysforthese.txt'
+                      given URIs and HTTP response headers, e.g.: 'tomcat 8',
+                      '/tmp/igot0daysforthese.txt'
+  -S <where>        - search strings in given places (default: headers,body)
   -b <bytes>        - num bytes to read from response. offset == response[0].
                       (default: 64)
-  -x <threads>      - num threads for concurrent checks (default: 50)
+  -x <threads>      - num threads for concurrent checks (default: 55)
   -c <seconds>      - num seconds for socket timeout (default: 2.0)
   -i                - use case-insensitive search
   -v                - verbose mode (default: quiet)
@@ -91,9 +92,9 @@ opts = {
   'ssl': False,
   'uri': '/',
   'searchstr': '',
-  'headers': True,
+  'where': ['headers', 'body'],
   'bytes': 64,
-  'threads': 50,
+  'threads': 55,
   'timeout': 2.0,
   'case_in': False,
   'verbose': False,
@@ -148,29 +149,27 @@ def get_strings(strings):
   return
 
 
-def scan(url, ses, searchstr, _bytes, timeout, headers, case_in=False,
+def scan(url, ses, searchstr, _bytes, timeout, where, case_in=False,
   verbose=False):
   if verbose:
     log(f'scanning {url}', 'verbose')
 
   r = ses.get(url, timeout=timeout, verify=False)
-  res = r.text
 
-  if case_in:
-    searchstr = searchstr.lower()
-    res = r.text.lower()
+  if 'body' in where:
+    res = r.text
+    if case_in:
+      searchstr = searchstr.lower()
+      res = r.text.lower()
+    if searchstr in r.text:
+      idx = r.text.index(searchstr)
+      res = repr(r.text[idx:idx+_bytes])
+      log(f'{url} | body   | {res}', 'good')
 
-  # resp body
-  if searchstr in r.text:
-    idx = r.text.index(searchstr)
-    res = repr(r.text[idx:idx+_bytes])
-    log(f'{url} | {searchstr} (body) => {res}', 'good')
-
-  # resp headers
-  if headers:
+  if 'headers' in where:
     for k,v in r.headers.items():
       if searchstr in k or searchstr in v:
-        log(f"{url} | {searchstr} (headers) => {k}: {v}", 'good')
+        log(f"{url} | header | {k}: {v}", 'good')
 
   return
 
@@ -226,7 +225,7 @@ def parse_cmdline(cmdline):
   global opts
 
   try:
-    _opts, _args = getopt.getopt(sys.argv[1:], 'h:p:tu:rs:b:x:c:ivVH')
+    _opts, _args = getopt.getopt(sys.argv[1:], 'h:p:tu:s:S:b:x:c:ivVH')
     for o, a in _opts:
       if o == '-h':
         opts['hosts'] = a
@@ -236,10 +235,12 @@ def parse_cmdline(cmdline):
         opts['ssl'] = True
       if o == '-u':
         opts['uri'] = a
-      if o == '-r':
-        opts['headers'] = False
       if o == '-s':
         opts['searchstr'] = a
+      if o == '-S':
+        opts['where'] = a.split(',')
+        if 'headers' not in opts['where'] and 'body' not in opts['where']:
+          log("nope, i only know 'body' and 'headers'", 'error')
       if o == '-b':
         opts['bytes'] = int(a)
       if o == '-x':
@@ -282,11 +283,12 @@ def main(cmdline):
       url = build_url(host, opts['port'], opts['uri'], opts['ssl'])
       for string in get_strings(opts['searchstr']):
         exe.submit(scan, url, session, string, opts['bytes'], opts['timeout'],
-          opts['headers'], opts['case_in'], opts['verbose'])
+          opts['where'], opts['case_in'], opts['verbose'])
 
   log('n00b n00b, game over', 'info')
 
   return
+
 
 if __name__ == '__main__':
   warnings.filterwarnings('ignore')
