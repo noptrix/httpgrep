@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 __author__ = 'noptrix'
-__version__ = '1.4'
+__version__ = '1.5'
 __copyright__ = 'santa clause'
 __license__ = 'MIT'
 
@@ -38,13 +38,13 @@ __license__ = 'MIT'
 SUCCESS = 0
 FAILURE = 1
 
-NORM = '\033[0;37;40m'
-BOLD = '\033[1;37;40m'
-RED = '\033[1;31;40m'
-GREEN = '\033[1;32;40m'
-YELLOW = '\033[1;33;40m'
-BLUE = '\033[1;34;40m'
-MAGENTA = '\033[1;35;40m'
+NORM = '\033[0m'
+BOLD = '\033[1;37;10m'
+RED = '\033[1;31;10m'
+GREEN = '\033[1;32;10m'
+YELLOW = '\033[1;33;10m'
+BLUE = '\033[1;34;10m'
+MAGENTA = '\033[1;35;10m'
 
 BANNER = BLUE + '''\
     __    __  __
@@ -75,7 +75,7 @@ HELP = BOLD + '''usage''' + NORM + '''
   -S <where>        - search strings in given places (default: headers,body)
   -b <bytes>        - num bytes to read from response. offset == response[0].
                       (default: 64)
-  -x <threads>      - num threads for concurrent checks (default: 55)
+  -x <threads>      - num threads for concurrent checks (default: 80)
   -c <seconds>      - num seconds for socket timeout (default: 2.0)
   -i                - use case-insensitive search
   -r                - perform reverse dns lookup for given IPv4 addresses
@@ -96,7 +96,7 @@ opts = {
   'searchstr': '',
   'where': ['headers', 'body'],
   'bytes': 64,
-  'threads': 55,
+  'threads': 80,
   'timeout': 2.0,
   'case_in': False,
   'rptr': False,
@@ -148,7 +148,7 @@ def get_strings(strings):
       for string in f:
         yield string.rstrip()
   else:
-      yield strings # single string
+    yield strings # single string
 
   return
 
