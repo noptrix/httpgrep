@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 __author__ = 'noptrix'
-__version__ = '1.3'
+__version__ = '1.4'
 __copyright__ = 'santa clause'
 __license__ = 'MIT'
 
@@ -78,6 +78,7 @@ HELP = BOLD + '''usage''' + NORM + '''
   -x <threads>      - num threads for concurrent checks (default: 55)
   -c <seconds>      - num seconds for socket timeout (default: 2.0)
   -i                - use case-insensitive search
+  -r                - perform reverse dns lookup for given IPv4 addresses
   -v                - verbose mode (default: quiet)
 
 ''' + BOLD + '''misc''' + NORM + '''
@@ -98,6 +99,7 @@ opts = {
   'threads': 55,
   'timeout': 2.0,
   'case_in': False,
+  'rptr': False,
   'verbose': False,
 }
 
@@ -131,12 +133,13 @@ def log(msg='', _type='normal', esc='\n'):
 
 
 def rptr(ipaddr):
-  try:
-    return socket.gethostbyaddr(ipaddr)[0]
-  except:
-    return ipaddr
+  if opts['rptr']:
+    try:
+      return socket.gethostbyaddr(ipaddr)[0]
+    except:
+      return ipaddr
 
-  return
+  return ipaddr
 
 
 def get_strings(strings):
@@ -226,7 +229,7 @@ def parse_cmdline(cmdline):
   global opts
 
   try:
-    _opts, _args = getopt.getopt(sys.argv[1:], 'h:p:tu:s:S:b:x:c:ivVH')
+    _opts, _args = getopt.getopt(sys.argv[1:], 'h:p:tu:s:S:b:x:c:irvVH')
     for o, a in _opts:
       if o == '-h':
         opts['hosts'] = a
@@ -250,6 +253,8 @@ def parse_cmdline(cmdline):
         opts['timeout'] = float(a)
       if o == '-i':
         opts['case_in'] = True
+      if o == '-r':
+        opts['rptr'] = True
       if o == '-v':
         opts['verbose'] = True
       if o == '-V':
