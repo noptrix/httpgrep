@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 __author__ = 'noptrix'
-__version__ = '1.5'
+__version__ = '1.6'
 __copyright__ = 'santa clause'
 __license__ = 'MIT'
 
@@ -79,6 +79,7 @@ HELP = BOLD + '''usage''' + NORM + '''
   -c <seconds>      - num seconds for socket timeout (default: 2.0)
   -i                - use case-insensitive search
   -r                - perform reverse dns lookup for given IPv4 addresses
+  -l <file>         - log urls and found strings to file
   -v                - verbose mode (default: quiet)
 
 ''' + BOLD + '''misc''' + NORM + '''
@@ -100,6 +101,7 @@ opts = {
   'timeout': 2.0,
   'case_in': False,
   'rptr': False,
+  'logfile': False,
   'verbose': False,
 }
 
@@ -129,6 +131,13 @@ def log(msg='', _type='normal', esc='\n'):
     for i in ('-', '\\', '|', '/'):
       sys.stderr.write(f'\r{BOLD}{BLUE}[{i}] {NORM}{msg} ')
       time.sleep(0.025)
+  elif _type == 'file':
+    try:
+      with open(opts['logfile'], 'a+', encoding='utf-8') as f:
+        print(msg, file=f)
+    except:
+      log('could not open or write to logfile', 'warn')
+
   return
 
 
@@ -169,11 +178,15 @@ def scan(url, ses, searchstr, _bytes, timeout, where, case_in=False,
       idx = r.text.index(searchstr)
       res = repr(r.text[idx:idx+_bytes])
       log(f'{url} | body   | {res}', 'good')
+      if opts['logfile']:
+        log(f'{url} | body   | {res}', 'file')
 
   if 'headers' in where:
     for k,v in r.headers.items():
       if searchstr in k or searchstr in v:
         log(f"{url} | header | {k}: {v}", 'good')
+        if opts['logfile']:
+          log(f"{url} | header | {k}: {v}", 'file')
 
   return
 
@@ -229,7 +242,7 @@ def parse_cmdline(cmdline):
   global opts
 
   try:
-    _opts, _args = getopt.getopt(sys.argv[1:], 'h:p:tu:s:S:b:x:c:irvVH')
+    _opts, _args = getopt.getopt(sys.argv[1:], 'h:p:tu:s:S:b:x:c:irl:vVH')
     for o, a in _opts:
       if o == '-h':
         opts['hosts'] = a
@@ -255,6 +268,8 @@ def parse_cmdline(cmdline):
         opts['case_in'] = True
       if o == '-r':
         opts['rptr'] = True
+      if o == '-l':
+        opts['logfile'] = a
       if o == '-v':
         opts['verbose'] = True
       if o == '-V':
