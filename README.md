@@ -29,14 +29,17 @@ opts
   -t                - use TLS/SSL to connect to service
   -u <URI>          - URI to search given strings in, e.g.: /foobar/, /foo.html
                       (default /)
-  -r                - do not search given strings in http response headers
   -s <string|file>  - a single string or multile strings in a file to find in
-                      given URIs, e.g. 'tomcat 8', '/tmp/igot0daysforthese.txt'
+                      given URIs and HTTP response headers, e.g.: 'tomcat 8',
+                      '/tmp/igot0daysforthese.txt'
+  -S <where>        - search strings in given places (default: headers,body)
   -b <bytes>        - num bytes to read from response. offset == response[0].
                       (default: 64)
-  -x <threads>      - num threads for concurrent checks (default: 50)
+  -x <threads>      - num threads for concurrent checks (default: 80)
   -c <seconds>      - num seconds for socket timeout (default: 2.0)
   -i                - use case-insensitive search
+  -r                - perform reverse dns lookup for given IPv4 addresses
+  -l <file>         - log urls and found strings to file
   -v                - verbose mode (default: quiet)
 
 misc
