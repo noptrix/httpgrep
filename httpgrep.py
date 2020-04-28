@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 __author__ = 'noptrix'
-__version__ = '1.6'
+__version__ = '1.7'
 __copyright__ = 'santa clause'
 __license__ = 'MIT'
 
@@ -72,6 +72,7 @@ HELP = BOLD + '''usage''' + NORM + '''
   -s <string|file>  - a single string or multile strings in a file to find in
                       given URIs and HTTP response headers, e.g.: 'tomcat 8',
                       '/tmp/igot0daysforthese.txt'
+  -U <useragent>    - set custom user-agent (default: firefox, rv75, windows)
   -S <where>        - search strings in given places (default: headers,body)
   -b <bytes>        - num bytes to read from response. offset == response[0].
                       (default: 64)
@@ -95,6 +96,7 @@ opts = {
   'ssl': False,
   'uri': '/',
   'searchstr': '',
+  'ua': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:75.0) Gecko/20100101 Firefox/75.0',
   'where': ['headers', 'body'],
   'bytes': 64,
   'threads': 80,
@@ -162,26 +164,26 @@ def get_strings(strings):
   return
 
 
-def scan(url, ses, searchstr, _bytes, timeout, where, case_in=False,
-  verbose=False):
-  if verbose:
+def scan(url, ses):
+  if opts['verbose']:
     log(f'scanning {url}', 'verbose')
 
-  r = ses.get(url, timeout=timeout, verify=False)
+  r = ses.get(url, timeout=opts['timeout'], headers={'User-Agent': opts['ua']},
+    verify=False)
 
-  if 'body' in where:
+  if 'body' in opts['where']:
     res = r.text
-    if case_in:
-      searchstr = searchstr.lower()
+    if opts['case_in']:
+      searchstr = opts['searchstr'].lower()
       res = r.text.lower()
     if searchstr in r.text:
       idx = r.text.index(searchstr)
-      res = repr(r.text[idx:idx+_bytes])
+      res = repr(r.text[idx:idx+opts['bytes']])
       log(f'{url} | body   | {res}', 'good')
       if opts['logfile']:
         log(f'{url} | body   | {res}', 'file')
 
-  if 'headers' in where:
+  if 'headers' in opts['where']:
     for k,v in r.headers.items():
       if searchstr in k or searchstr in v:
         log(f"{url} | header | {k}: {v}", 'good')
@@ -242,7 +244,7 @@ def parse_cmdline(cmdline):
   global opts
 
   try:
-    _opts, _args = getopt.getopt(sys.argv[1:], 'h:p:tu:s:S:b:x:c:irl:vVH')
+    _opts, _args = getopt.getopt(sys.argv[1:], 'h:p:tu:s:U:S:b:x:c:irl:vVH')
     for o, a in _opts:
       if o == '-h':
         opts['hosts'] = a
@@ -254,6 +256,8 @@ def parse_cmdline(cmdline):
         opts['uri'] = a
       if o == '-s':
         opts['searchstr'] = a
+      if o == '-U':
+        opts['ua'] = a
       if o == '-S':
         opts['where'] = a.split(',')
         if 'headers' not in opts['where'] and 'body' not in opts['where']:
@@ -303,8 +307,7 @@ def main(cmdline):
     for host in get_hosts(opts['hosts']):
       url = build_url(host, opts['port'], opts['uri'], opts['ssl'])
       for string in get_strings(opts['searchstr']):
-        exe.submit(scan, url, session, string, opts['bytes'], opts['timeout'],
-          opts['where'], opts['case_in'], opts['verbose'])
+        exe.submit(scan, url, session)
 
   log('n00b n00b, game over', 'info')
 
