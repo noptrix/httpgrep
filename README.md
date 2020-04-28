@@ -32,6 +32,7 @@ opts
   -s <string|file>  - a single string or multile strings in a file to find in
                       given URIs and HTTP response headers, e.g.: 'tomcat 8',
                       '/tmp/igot0daysforthese.txt'
+  -U <useragent>    - set custom user-agent (default: firefox, rv75, windows)
   -S <where>        - search strings in given places (default: headers,body)
   -b <bytes>        - num bytes to read from response. offset == response[0].
                       (default: 64)
