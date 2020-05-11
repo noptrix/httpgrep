@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 __author__ = 'noptrix'
-__version__ = '1.7'
+__version__ = '1.8'
 __copyright__ = 'santa clause'
 __license__ = 'MIT'
 
@@ -179,16 +179,16 @@ def scan(url, ses):
     if searchstr in r.text:
       idx = r.text.index(searchstr)
       res = repr(r.text[idx:idx+opts['bytes']])
-      log(f'{url} | body   | {res}', 'good')
+      log(f'{url:30} | body   | {res}', 'good')
       if opts['logfile']:
-        log(f'{url} | body   | {res}', 'file')
+        log(f'{url:30} | body   | {res}', 'file')
 
   if 'headers' in opts['where']:
     for k,v in r.headers.items():
       if searchstr in k or searchstr in v:
-        log(f"{url} | header | {k}: {v}", 'good')
+        log(f"{url:30} | header | {k}: {v}", 'good')
         if opts['logfile']:
-          log(f"{url} | header | {k}: {v}", 'file')
+          log(f"{url:30} | header | {k}: {v}", 'file')
 
   return
 
@@ -316,5 +316,9 @@ def main(cmdline):
 
 if __name__ == '__main__':
   warnings.filterwarnings('ignore')
-  main(sys.argv[1:])
+  try:
+    main(sys.argv[1:])
+  except KeyboardInterrupt:
+    log('you aborted me', 'warn')
+    os._exit(SUCCESS)
 
