@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 __author__ = 'noptrix'
-__version__ = '1.8'
+__version__ = '1.9'
 __copyright__ = 'santa clause'
 __license__ = 'MIT'
 
@@ -63,9 +63,10 @@ HELP = BOLD + '''usage''' + NORM + '''
 ''' + BOLD + '''opts''' + NORM + '''
 
   -h <hosts|file>   - single host or host-range/cidr-range or file containing
-                      hosts, e.g.: foobar.net, 192.168.0.1-192.168.0.254,
+                      hosts or file containing URLs, e.g.: foobar.net,
+                      192.168.0.1-192.168.0.254,
                       192.168.0.0/24, /tmp/hosts.txt
-  -p <port>         - port to connect to (default: 80)
+  -p <port>         - port to connect to (default: 80 if hosts were given)
   -t                - use TLS/SSL to connect to service
   -u <URI>          - URI to search given strings in, e.g.: /foobar/, /foo.html
                       (default /)
@@ -77,7 +78,7 @@ HELP = BOLD + '''usage''' + NORM + '''
   -b <bytes>        - num bytes to read from response. offset == response[0].
                       (default: 64)
   -x <threads>      - num threads for concurrent checks (default: 80)
-  -c <seconds>      - num seconds for socket timeout (default: 2.0)
+  -c <seconds>      - num seconds for socket timeout (default: 3.0)
   -i                - use case-insensitive search
   -r                - perform reverse dns lookup for given IPv4 addresses
   -l <file>         - log urls and found strings to file
@@ -96,11 +97,11 @@ opts = {
   'ssl': False,
   'uri': '/',
   'searchstr': '',
-  'ua': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:75.0) Gecko/20100101 Firefox/75.0',
+  'ua': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:87.0) Gecko/20100101 Firefox/87.0',
   'where': ['headers', 'body'],
   'bytes': 64,
   'threads': 80,
-  'timeout': 2.0,
+  'timeout': 3.0,
   'case_in': False,
   'rptr': False,
   'logfile': False,
@@ -179,16 +180,16 @@ def scan(url, ses):
     if searchstr in r.text:
       idx = r.text.index(searchstr)
       res = repr(r.text[idx:idx+opts['bytes']])
-      log(f'{url:30} | body   | {res}', 'good')
+      log(f'{url} => body => {res}', 'good')
       if opts['logfile']:
-        log(f'{url:30} | body   | {res}', 'file')
+        log(f'{url} => body => {res}', 'file')
 
   if 'headers' in opts['where']:
     for k,v in r.headers.items():
       if searchstr in k or searchstr in v:
-        log(f"{url:30} | header | {k}: {v}", 'good')
+        log(f"{url} => header => {k}: {v}", 'good')
         if opts['logfile']:
-          log(f"{url:30} | header | {k}: {v}", 'file')
+          log(f"{url} => header => {k}: {v}", 'file')
 
   return
 
@@ -305,7 +306,9 @@ def main(cmdline):
     log('w00t w00t, game started', 'info')
     session = requests.Session()
     for host in get_hosts(opts['hosts']):
-      url = build_url(host, opts['port'], opts['uri'], opts['ssl'])
+      url = host
+      if 'http' not in host:
+        url = build_url(host, opts['port'], opts['uri'], opts['ssl'])
       for string in get_strings(opts['searchstr']):
         exe.submit(scan, url, session)
 
