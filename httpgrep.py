@@ -19,6 +19,7 @@
 ################################################################################
 
 
+import re
 import sys
 import os
 import socket
@@ -30,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 __author__ = 'noptrix'
-__version__ = '2.0'
+__version__ = '2.1'
 __copyright__ = 'santa clause'
 __license__ = 'MIT'
 
@@ -103,7 +104,7 @@ opts = {
   'searchstr': '',
   'method': 'get',
   'ua': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:87.0) Gecko/20100101 Firefox/87.0',
-  'where': ['headers', 'body'],
+  'where': ('headers', 'body'),
   'bytes': 64,
   'threads': 80,
   'timeout': 3.0,
@@ -170,29 +171,32 @@ def get_strings(strings):
   return
 
 
-def scan(url):
-  if opts['verbose']:
-    log(f'scanning {url}', 'verbose')
-
+def http_req(url):
   m = getattr(requests, opts['method'])
   r = m(url, timeout=opts['timeout'], headers={'User-Agent': opts['ua']},
     verify=False)
 
+  return r
+
+
+def scan(url):
+  if opts['verbose']:
+    log(f'scanning {url}', 'verbose')
+
+  r = http_req(url)
+
   if 'body' in opts['where']:
-    res = r.text
-    if opts['case_in']:
-      searchstr = opts['searchstr'].lower()
-      res = r.text.lower()
-    if searchstr in r.text:
-      idx = r.text.index(searchstr)
+    if re.search(opts['searchstr'], r.text, opts['case_in']):
+      idx = r.text.index(opts['searchstr'])
       res = repr(r.text[idx:idx+opts['bytes']])
       log(f'{url} => body => {res}', 'good')
       if opts['logfile']:
         log(f'{url} => body => {res}', 'file')
 
   if 'headers' in opts['where']:
-    for k,v in r.headers.items():
-      if searchstr in k or searchstr in v:
+    for k, v in r.headers.items():
+      if re.search(opts['searchstr'], k, opts['case_in']) or \
+        re.search(opts['searchstr'], v, opts['case_in']):
         log(f"{url} => header => {k}: {v}", 'good')
         if opts['logfile']:
           log(f"{url} => header => {k}: {v}", 'file')
@@ -300,7 +304,7 @@ def parse_cmdline(cmdline):
       if o == '-c':
         opts['timeout'] = float(a)
       if o == '-i':
-        opts['case_in'] = True
+        opts['case_in'] = re.IGNORECASE
       if o == '-r':
         opts['rptr'] = True
       if o == '-l':
