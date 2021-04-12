@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 __author__ = 'noptrix'
-__version__ = '1.9'
+__version__ = '2.0'
 __copyright__ = 'santa clause'
 __license__ = 'MIT'
 
@@ -66,6 +66,8 @@ HELP = BOLD + '''usage''' + NORM + '''
                       hosts or file containing URLs, e.g.: foobar.net,
                       192.168.0.1-192.168.0.254,
                       192.168.0.0/24, /tmp/hosts.txt
+                      NOTE: hosts can also contain ':<port>' on cmdline or in
+                      file.
   -p <port>         - port to connect to (default: 80 if hosts were given)
   -t                - use TLS/SSL to connect to service
   -u <URI>          - URI to search given strings in, e.g.: /foobar/, /foo.html
@@ -73,7 +75,9 @@ HELP = BOLD + '''usage''' + NORM + '''
   -s <string|file>  - a single string or multile strings in a file to find in
                       given URIs and HTTP response headers, e.g.: 'tomcat 8',
                       '/tmp/igot0daysforthese.txt'
-  -U <useragent>    - set custom user-agent (default: firefox, rv75, windows)
+  -X <method>       - specify HTTP request method to use (default: get).
+                      use '?' to list available methods.
+  -U <useragent>    - set custom user-agent (default: firefox, rv84, windows)
   -S <where>        - search strings in given places (default: headers,body)
   -b <bytes>        - num bytes to read from response. offset == response[0].
                       (default: 64)
@@ -97,6 +101,7 @@ opts = {
   'ssl': False,
   'uri': '/',
   'searchstr': '',
+  'method': 'get',
   'ua': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:87.0) Gecko/20100101 Firefox/87.0',
   'where': ['headers', 'body'],
   'bytes': 64,
@@ -165,11 +170,12 @@ def get_strings(strings):
   return
 
 
-def scan(url, ses):
+def scan(url):
   if opts['verbose']:
     log(f'scanning {url}', 'verbose')
 
-  r = ses.get(url, timeout=opts['timeout'], headers={'User-Agent': opts['ua']},
+  m = getattr(requests, opts['method'])
+  r = m(url, timeout=opts['timeout'], headers={'User-Agent': opts['ua']},
     verify=False)
 
   if 'body' in opts['where']:
@@ -194,15 +200,18 @@ def scan(url, ses):
   return
 
 
-def build_url(host, port, uri, ssl=False):
+def build_url(host):
   scheme = 'http'
-  if ssl:
+  if opts['ssl']:
     scheme = 'https'
 
-  url = f'{scheme}://{host}:{port}{uri}'
+  if ':' in host:
+    return f'{scheme}://{host}{opts["uri"]}'
 
-  if port == '80' or port == '443':
-    url = f'{scheme}://{host}{uri}'
+  url = f'{scheme}://{host}:{opts["port"]}{opts["uri"]}'
+
+  if opts['port'] == '80' or opts['port'] == '443':
+    url = f'{scheme}://{host}{opts["uri"]}'
 
   return url
 
@@ -231,12 +240,33 @@ def get_hosts(hosts):
   return
 
 
+def check_search_place():
+  if 'headers' not in opts['where'] and 'body' not in opts['where']:
+    log("nope, i only know 'body' and 'headers'", 'error')
+
+  return
+
+
+def check_http_method():
+  allowed = ('head', 'get', 'post', 'put', 'delete', 'patch', 'options')
+
+  if opts['method'] == '?':
+    log('supported http methods\n', 'info')
+    for i in allowed:
+      log(f'{i}', 'verbose')
+    sys.exit(SUCCESS)
+  if opts['method'] not in allowed:
+    log(f'unsupported http method: {opts["method"]}', 'error')
+
+  return
+
+
 def check_argv(cmdline):
   needed = ['-h', '-s', '-V', '-H']
 
   if '-h' not in cmdline or '-s' not in cmdline or \
     set(needed).isdisjoint(set(cmdline)):
-      log('wrong usage, d00d.', 'error')
+      log('WTF? mount /dev/brain!', 'error')
 
   return
 
@@ -245,7 +275,7 @@ def parse_cmdline(cmdline):
   global opts
 
   try:
-    _opts, _args = getopt.getopt(sys.argv[1:], 'h:p:tu:s:U:S:b:x:c:irl:vVH')
+    _opts, _args = getopt.getopt(sys.argv[1:], 'h:p:tu:s:X:U:S:b:x:c:irl:vVH')
     for o, a in _opts:
       if o == '-h':
         opts['hosts'] = a
@@ -257,12 +287,12 @@ def parse_cmdline(cmdline):
         opts['uri'] = a
       if o == '-s':
         opts['searchstr'] = a
+      if o == '-X':
+        opts['method'] = a
       if o == '-U':
         opts['ua'] = a
       if o == '-S':
         opts['where'] = a.split(',')
-        if 'headers' not in opts['where'] and 'body' not in opts['where']:
-          log("nope, i only know 'body' and 'headers'", 'error')
       if o == '-b':
         opts['bytes'] = int(a)
       if o == '-x':
@@ -301,16 +331,18 @@ def main(cmdline):
   check_argc(cmdline)
   parse_cmdline(cmdline)
   check_argv(cmdline)
+  check_http_method()
+  check_search_place()
 
   with ThreadPoolExecutor(opts['threads']) as exe:
     log('w00t w00t, game started', 'info')
-    session = requests.Session()
+    log('wait bitch, scanning', 'info')
     for host in get_hosts(opts['hosts']):
       url = host
       if 'http' not in host:
-        url = build_url(host, opts['port'], opts['uri'], opts['ssl'])
+        url = build_url(host)
       for string in get_strings(opts['searchstr']):
-        exe.submit(scan, url, session)
+        exe.submit(scan, url)
 
   log('n00b n00b, game over', 'info')
 
