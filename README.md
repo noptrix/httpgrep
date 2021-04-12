@@ -26,6 +26,8 @@ opts
                       hosts or file containing URLs, e.g.: foobar.net,
                       192.168.0.1-192.168.0.254,
                       192.168.0.0/24, /tmp/hosts.txt
+                      NOTE: hosts can also contain ':<port>' on cmdline or in
+                      file.
   -p <port>         - port to connect to (default: 80 if hosts were given)
   -t                - use TLS/SSL to connect to service
   -u <URI>          - URI to search given strings in, e.g.: /foobar/, /foo.html
@@ -33,7 +35,9 @@ opts
   -s <string|file>  - a single string or multile strings in a file to find in
                       given URIs and HTTP response headers, e.g.: 'tomcat 8',
                       '/tmp/igot0daysforthese.txt'
-  -U <useragent>    - set custom user-agent (default: firefox, rv75, windows)
+  -X <method>       - specify HTTP request method to use (default: get).
+                      use '?' to list available methods.
+  -U <useragent>    - set custom user-agent (default: firefox, rv84, windows)
   -S <where>        - search strings in given places (default: headers,body)
   -b <bytes>        - num bytes to read from response. offset == response[0].
                       (default: 64)
