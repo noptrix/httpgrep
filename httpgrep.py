@@ -31,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 __author__ = 'noptrix'
-__version__ = '2.2'
+__version__ = '2.3'
 __copyright__ = 'santa clause'
 __license__ = 'MIT'
 
@@ -189,8 +189,8 @@ def scan(url):
   r = http_req(url)
 
   if 'body' in opts['where']:
-    if re.search(opts['searchstr'], r.text, opts['case_in']):
-      idx = r.text.index(opts['searchstr'])
+    idx = re.search(opts['searchstr'], r.text, opts['case_in']).regs[0][0]
+    if idx:
       res = repr(r.text[idx:idx+opts['bytes']])
       log(f'{url} | body   | {res}', 'good')
       if opts['logfile']:
