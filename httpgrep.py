@@ -31,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 __author__ = 'noptrix'
-__version__ = '2.3'
+__version__ = '2.4'
 __copyright__ = 'santa clause'
 __license__ = 'MIT'
 
@@ -47,10 +47,10 @@ YELLOW = '\033[1;33;10m'
 BLUE = '\033[1;34;10m'
 MAGENTA = '\033[1;35;10m'
 
-BANNER = BLUE + '''\
+BANNER = BLUE + r'''
     __    __  __
    / /_  / /_/ /_____  ____ _________  ____
-  / __ \/ __/ __/ __ \/ __ `/ ___/ _ \/ __ \\
+  / __ \/ __/ __/ __ \/ __ `/ ___/ _ \/ __ \
  / / / / /_/ /_/ /_/ / /_/ / /  /  __/ /_/ /
 /_/ /_/\__/\__/ .___/\__, /_/   \___/ .___/
              /_/    /____/         /_/
