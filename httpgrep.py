@@ -31,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 __author__ = 'noptrix'
-__version__ = '2.4'
+__version__ = '2.5'
 __copyright__ = 'santa clause'
 __license__ = 'MIT'
 
@@ -181,7 +181,7 @@ def http_req(url):
   return r
 
 
-def scan(url):
+def scan(url, string):
   if opts['verbose']:
     log(f'scanning {url}' + ' ' * 20, 'verbose', esc='\r')
     sys.stdout.flush()
@@ -189,7 +189,7 @@ def scan(url):
   r = http_req(url)
 
   if 'body' in opts['where']:
-    idx = re.search(opts['searchstr'], r.text, opts['case_in']).regs[0][0]
+    idx = re.search(string, r.text, opts['case_in']).regs[0][0]
     if idx:
       res = repr(r.text[idx:idx+opts['bytes']])
       log(f'{url} | body   | {res}', 'good')
@@ -198,8 +198,8 @@ def scan(url):
 
   if 'headers' in opts['where']:
     for k, v in r.headers.items():
-      if re.search(opts['searchstr'], k, opts['case_in']) or \
-        re.search(opts['searchstr'], v, opts['case_in']):
+      if re.search(string, k, opts['case_in']) or \
+        re.search(string, v, opts['case_in']):
         log(f"{url} | header | {k}: {v}", 'good')
         if opts['logfile']:
           log(f"{url} | header | {k}: {v}", 'file')
@@ -363,7 +363,7 @@ def main(cmdline):
       if 'http' not in host:
         url = build_url(host)
       for string in get_strings(opts['searchstr']):
-        exe.submit(scan, url)
+        exe.submit(scan, url, string)
 
   if opts['verbose']:
     log('\n\n')
