@@ -24,14 +24,17 @@ import sys
 import os
 import socket
 import ipaddress
+import random
+import time
+import termios
 import requests
 import warnings
 import getopt
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 
 __author__ = 'noptrix'
-__version__ = '2.5'
+__version__ = '2.6'
 __copyright__ = 'santa clause'
 __license__ = 'MIT'
 
@@ -47,8 +50,7 @@ YELLOW = '\033[1;33;10m'
 BLUE = '\033[1;34;10m'
 MAGENTA = '\033[1;35;10m'
 
-BANNER = BLUE + r'''
-    __    __  __
+BANNER = BLUE + r'''    __    __  __
    / /_  / /_/ /_____  ____ _________  ____
   / __ \/ __/ __/ __ \/ __ `/ ___/ _ \/ __ \
  / / / / /_/ /_/ /_/ / /_/ / /  /  __/ /_/ /
@@ -61,7 +63,7 @@ HELP = BOLD + '''usage''' + NORM + '''
 
   httpgrep -h <args> -s <arg> [opts] | <misc>
 
-''' + BOLD + '''opts''' + NORM + '''
+''' + BOLD + '''target options''' + NORM + '''
 
   -h <hosts|file>   - single host/url or host-/cidr-range or file containing
                       hosts or file containing URLs, e.g.: foobar.net,
@@ -70,32 +72,92 @@ HELP = BOLD + '''usage''' + NORM + '''
                       file.
   -p <port>         - port to connect to (default: 80 if hosts were given)
   -t                - use TLS/SSL to connect to service
-  -u <URI>          - URI to search given strings in, e.g.: /foobar/, /foo.html
-                      (default: /)
-  -s <str|file>     - a single string/regex or multile strings/regex in a file
-                      to find in given URIs and HTTP response headers,
-                      e.g.: 'tomcat 8', '/tmp/igot0daysforthese.txt'
-  -S <where>        - search strings in given places (default: headers,body)
+  -u <URI|file>     - URI or comma-separated URIs or file with URIs (one per
+                      line) to search given strings in, e.g.: /foobar/,
+                      /foo.html, /admin,/login, /tmp/paths.txt (default: /)
+  -r                - perform reverse dns lookup for given IPv4 addresses
+                      NOTE: this will slow down the scanz
+
+''' + BOLD + '''http options''' + NORM + '''
+
   -X <method>       - specify HTTP request method to use (default: get).
                       use '?' to list available methods.
   -a <user:pass>    - http auth credentials (format: 'user:pass')
   -U <UA>           - set custom User-Agent (default: firefox, rv84, windows)
+  -A                - use random user-agent per request
+  -R <headers>      - set custom headers (format: 'foo=bar;lol=lulz;...')
+  -C <cookies>      - set cookies (format: 'foo=bar;lol=lulz;...')
+  -F                - don't follow HTTP redirects
+  -P <proxy>        - use proxy (format: '[http|https|socks4|socks5]://host:port')
+
+''' + BOLD + '''search options''' + NORM + '''
+
+  -s <str|file>     - a single string/regex or multile strings/regex in a file
+                      to find in given URIs and HTTP response headers,
+                      e.g.: 'tomcat 8', '/tmp/igot0daysforthese.txt'
+  -S <where>        - search strings in given places (default: headers,body)
   -b <bytes>        - num bytes to read from response. offset == response[0].
                       (default: 64)
+  -i                - use case-insensitive search
+
+''' + BOLD + '''scan options''' + NORM + '''
+
   -x <threads>      - num threads for concurrent scans and checks (default: 80)
   -c <seconds>      - num seconds for socket timeout (default: 3.0)
-  -i                - use case-insensitive search
-  -r                - perform reverse dns lookup for given IPv4 addresses
-                      NOTE: this will slow down the scanz
+  -f <codes>        - only report responses with given HTTP status codes,
+                      e.g.: '200', '200,301,302'
+
+''' + BOLD + '''output options''' + NORM + '''
+
   -l <file>         - log found matches to file
   -v                - verbose mode (default: quiet)
 
-''' + BOLD + '''misc''' + NORM + '''
+''' + BOLD + '''misc options''' + NORM + '''
 
   -H                - print help
   -V                - print version information
 '''
 
+
+USER_AGENTS = [
+  # windows - chrome
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+  ' (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36'
+  ' (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+  # windows - firefox
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0)'
+  ' Gecko/20100101 Firefox/125.0',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0)'
+  ' Gecko/20100101 Firefox/124.0',
+  # windows - edge
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+  ' (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0',
+  # macos - chrome
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+  ' (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  # macos - firefox
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:125.0)'
+  ' Gecko/20100101 Firefox/125.0',
+  # macos - safari
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15'
+  ' (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15',
+  # linux - chrome
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
+  ' (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  # linux - firefox
+  'Mozilla/5.0 (X11; Linux x86_64; rv:125.0)'
+  ' Gecko/20100101 Firefox/125.0',
+  # linux - chromium
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
+  ' (KHTML, like Gecko) Chromium/123.0.0.0 Chrome/123.0.0.0 Safari/537.36',
+  # freebsd - firefox
+  'Mozilla/5.0 (X11; FreeBSD amd64; rv:125.0)'
+  ' Gecko/20100101 Firefox/125.0',
+  # freebsd - chrome
+  'Mozilla/5.0 (X11; FreeBSD amd64) AppleWebKit/537.36'
+  ' (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+]
 
 opts = {
   'hosts': None,
@@ -107,6 +169,12 @@ opts = {
   'method': 'get',
   'auth': False,
   'ua': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:87.0) Gecko/20100101 Firefox/87.0',
+  'rand_agent': False,
+  'headers': {},
+  'cookies': {},
+  'no_redir': False,
+  'filter_codes': [],
+  'proxy': None,
   'bytes': 64,
   'threads': 80,
   'timeout': 3.0,
@@ -152,6 +220,21 @@ def log(msg='', _type='normal', esc='\n'):
   return
 
 
+def get_user_agent():
+  if opts['rand_agent']:
+    return random.choice(USER_AGENTS)
+  return opts['ua']
+
+
+def parse_kv(s):
+  parsed = {}
+  for item in s.split(';'):
+    kv = item.strip().split('=', 1)
+    if len(kv) == 2:
+      parsed[kv[0].strip()] = kv[1].strip()
+  return parsed
+
+
 def rptr(ipaddr):
   if opts['rptr']:
     try:
@@ -160,6 +243,25 @@ def rptr(ipaddr):
       return ipaddr
 
   return ipaddr
+
+
+def get_uris():
+  uri = opts['uri']
+  if os.path.isfile(uri):
+    with open(uri, 'r', encoding='utf-8') as f:
+      for line in f:
+        line = line.rstrip()
+        if line:
+          yield line
+  elif ',' in uri:
+    for u in uri.split(','):
+      u = u.strip()
+      if u:
+        yield u
+  else:
+    yield uri
+
+  return
 
 
 def get_strings(strings):
@@ -175,53 +277,62 @@ def get_strings(strings):
 
 def http_req(url):
   m = getattr(requests, opts['method'])
-  r = m(url, timeout=opts['timeout'], headers={'User-Agent': opts['ua']},
-    verify=False, auth=opts['auth'])
+  headers = {'User-Agent': get_user_agent()}
+  headers.update(opts['headers'])
+  proxies = {'http': opts['proxy'], 'https': opts['proxy']} if opts['proxy'] \
+    else None
+  r = m(url, timeout=opts['timeout'], headers=headers, verify=False,
+    auth=opts['auth'], cookies=opts['cookies'], proxies=proxies,
+    allow_redirects=not opts['no_redir'])
 
   return r
 
 
-def scan(url, string):
+def scan(url, string, url_width):
   if opts['verbose']:
     log(f'scanning {url}' + ' ' * 20, 'verbose', esc='\r')
     sys.stdout.flush()
 
-  r = http_req(url)
+  try:
+    r = http_req(url)
+  except Exception:
+    return
+
+  if opts['filter_codes'] and r.status_code not in opts['filter_codes']:
+    return
+
+  u = f'{url:<{url_width}}'
 
   if 'body' in opts['where']:
-    idx = re.search(string, r.text, opts['case_in']).regs[0][0]
-    if idx:
+    m = re.search(string, r.text, opts['case_in'])
+    if m:
+      idx = m.start()
       res = repr(r.text[idx:idx+opts['bytes']])
-      log(f'{url} | body   | {res}', 'good')
+      log(f'{u} | body   | {res}', 'good')
       if opts['logfile']:
-        log(f'{url} | body   | {res}', 'file')
+        log(f'{u} | body   | {res}', 'file')
 
   if 'headers' in opts['where']:
     for k, v in r.headers.items():
       if re.search(string, k, opts['case_in']) or \
         re.search(string, v, opts['case_in']):
-        log(f"{url} | header | {k}: {v}", 'good')
+        log(f'{u} | header | {k}: {v}', 'good')
         if opts['logfile']:
-          log(f"{url} | header | {k}: {v}", 'file')
+          log(f'{u} | header | {k}: {v}', 'file')
 
   if opts['verbose']:
-    sys.stdout.flush()
     log('\n')
 
   return
 
 
-def build_url(host):
-  scheme = 'http'
-  if opts['ssl']:
-    scheme = 'https'
+def build_url(host, uri):
+  scheme = 'https' if opts['ssl'] else 'http'
 
   if ':' in host:
-    return f'{scheme}://{host}{opts["uri"]}'
+    return f'{scheme}://{host}{uri}'
 
-  url = f'{scheme}://{host}:{opts["port"]}{opts["uri"]}'
-
-  return url
+  return f'{scheme}://{host}:{opts["port"]}{uri}'
 
 
 def get_hosts(hosts):
@@ -230,18 +341,19 @@ def get_hosts(hosts):
       with open(hosts, 'r', encoding='utf-8') as f:
         for host in f:
           yield host.rstrip()
-    else:
-      if '-' in hosts:
+    elif '/' in hosts and 'http' not in hosts:
+      for ipaddr in ipaddress.IPv4Network(hosts).hosts():
+        yield rptr(str(ipaddr))
+    elif '-' in hosts and 'http' not in hosts:
+      try:
         start = ipaddress.IPv4Address(hosts.split('-')[0])
         end = ipaddress.IPv4Address(hosts.split('-')[1])
         for i in range(int(start), int(end) + 1):
-          ipaddr = str(ipaddress.IPv4Address(i))
-          yield rptr(str(ipaddr))
-      elif '/' in hosts and 'http' not in hosts:
-        for ipaddr in ipaddress.IPv4Network(hosts).hosts():
-          yield rptr(str(ipaddr))
-      else:
-        yield hosts # single host or url
+          yield rptr(str(ipaddress.IPv4Address(i)))
+      except ValueError:
+        yield hosts
+    else:
+      yield hosts
   except Exception as err:
     log(err.args[0].lower(), 'error')
 
@@ -291,44 +403,56 @@ def parse_cmdline(cmdline):
   global opts
 
   try:
-    _opts, _args = getopt.getopt(sys.argv[1:], 'h:p:tu:s:S:X:a:U:b:x:c:irl:vVH')
+    _opts, _args = getopt.getopt(sys.argv[1:], 'h:p:tu:s:S:X:a:U:AR:C:FP:b:x:c:irl:f:vVH')
     for o, a in _opts:
       if o == '-h':
         opts['hosts'] = a
-      if o == '-p':
+      elif o == '-p':
         opts['port'] = a
-      if o == '-t':
+      elif o == '-t':
         opts['ssl'] = True
-      if o == '-u':
+      elif o == '-u':
         opts['uri'] = a
-      if o == '-s':
+      elif o == '-s':
         opts['searchstr'] = a
-      if o == '-S':
+      elif o == '-S':
         opts['where'] = a.split(',')
-      if o == '-X':
+      elif o == '-X':
         opts['method'] = a
-      if o == '-a':
+      elif o == '-a':
         opts['auth'] = tuple(a.split(':', 1))
-      if o == '-U':
+      elif o == '-U':
         opts['ua'] = a
-      if o == '-b':
+      elif o == '-A':
+        opts['rand_agent'] = True
+      elif o == '-R':
+        opts['headers'].update(parse_kv(a))
+      elif o == '-C':
+        opts['cookies'].update(parse_kv(a))
+      elif o == '-F':
+        opts['no_redir'] = True
+      elif o == '-P':
+        opts['proxy'] = a
+      elif o == '-b':
         opts['bytes'] = int(a)
-      if o == '-x':
+      elif o == '-x':
         opts['threads'] = int(a)
-      if o == '-c':
+      elif o == '-c':
         opts['timeout'] = float(a)
-      if o == '-i':
+      elif o == '-f':
+        opts['filter_codes'] = [int(c) for c in a.split(',')]
+      elif o == '-i':
         opts['case_in'] = re.IGNORECASE
-      if o == '-r':
+      elif o == '-r':
         opts['rptr'] = True
-      if o == '-l':
+      elif o == '-l':
         opts['logfile'] = a
-      if o == '-v':
+      elif o == '-v':
         opts['verbose'] = True
-      if o == '-V':
+      elif o == '-V':
         log(f'httpgrep v{__version__}', _type='info')
         sys.exit(SUCCESS)
-      if o == '-H':
+      elif o == '-H':
         log(HELP)
         sys.exit(SUCCESS)
   except (getopt.GetoptError, ValueError) as err:
@@ -353,17 +477,26 @@ def main(cmdline):
   check_search_place()
   check_auth()
 
+  uris = list(get_uris())
+  strings = list(get_strings(opts['searchstr']))
+
+  url_width = 0
+  for host in get_hosts(opts['hosts']):
+    urls = [host] if 'http' in host else [build_url(host, u) for u in uris]
+    for url in urls:
+      if len(url) > url_width:
+        url_width = len(url)
+
   with ThreadPoolExecutor(opts['threads']) as exe:
     log('w00t w00t, game started', 'info')
     log('wait bitch, scanning', 'info')
     if opts['verbose']:
       log('\n')
     for host in get_hosts(opts['hosts']):
-      url = host
-      if 'http' not in host:
-        url = build_url(host)
-      for string in get_strings(opts['searchstr']):
-        exe.submit(scan, url, string)
+      urls = [host] if 'http' in host else [build_url(host, u) for u in uris]
+      for url in urls:
+        for string in strings:
+          exe.submit(scan, url, string, url_width)
 
   if opts['verbose']:
     log('\n\n')
@@ -374,6 +507,13 @@ def main(cmdline):
 
 if __name__ == '__main__':
   warnings.filterwarnings('ignore')
+  try:
+    _fd = sys.stdin.fileno()
+    _tc = termios.tcgetattr(_fd)
+    _tc[3] &= ~termios.ECHOCTL
+    termios.tcsetattr(_fd, termios.TCSADRAIN, _tc)
+  except Exception:
+    pass
   try:
     main(sys.argv[1:])
   except KeyboardInterrupt:
