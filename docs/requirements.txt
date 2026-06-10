@@ -1,1 +1,6 @@
-requests
+httpx
+
+# optional, auto-used if present:
+#   httpx[socks]   - socks4/socks5 proxies (-P socks5://..)
+#   uvloop         - faster event loop
+#   aiodns         - non-blocking dns (reverse lookups, -r)

@@ -4,6 +4,7 @@ clean.sh
 *.db
 .DS_Store
 .git
+httpgrep.session
 id_dsa
 id_rsa
 *.key
