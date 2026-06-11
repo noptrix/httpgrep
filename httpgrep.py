@@ -50,8 +50,8 @@ except ImportError:
 
 
 __author__ = 'noptrix'
-__version__ = '3.1'
-__copyright__ = 'santa clause'
+__version__ = '3.2'
+__copyright__ = 'Santa Clause'
 __license__ = 'MIT'
 
 
@@ -135,11 +135,15 @@ HELP = BOLD + '''usage''' + NORM + '''
   -s <str|file>     - a single string/regex or multile strings/regex in a file
                       to find in given URIs and HTTP response headers,
                       e.g.: 'tomcat 8', '/tmp/igot0daysforthese.txt'
-  -S <where>        - search strings in given places (default: headers,body)
+  -S <str|file>     - invert (grep -v): drop a match if the searched content
+                      also matches this string/regex (or file), e.g. to filter
+                      out dynamic error / not-found pages
+  -w <where>        - search strings in given places (default: headers,body)
   -b <bytes>        - num bytes of context to show from a body match
                       (default: 64). NOTE: only the first 256 KB of a body
                       is read and searched (for speed)
   -i                - use case-insensitive search
+  -I                - use case-insensitive invert (for -S)
   -1                - stop scanning a host after its first match (skips its
                       remaining uris, ports and search strings)
 
@@ -181,7 +185,7 @@ HELP = BOLD + '''usage''' + NORM + '''
   $ httpgrep -h foobar.net -s apache
 
   # scan a CIDR range on port 8080, search for 'tomcat' in body only
-  $ httpgrep -h 192.168.0.0/24 -p 8080 -s tomcat -S body
+  $ httpgrep -h 192.168.0.0/24 -p 8080 -s tomcat -w body
 
   # scan a host across multiple ports and a port range for 'jenkins'
   $ httpgrep -h 192.168.0.10 -p 80,443,8080,8000-8100 -s jenkins -i
@@ -196,7 +200,10 @@ HELP = BOLD + '''usage''' + NORM + '''
   $ httpgrep -h 10.0.0.1-10.0.0.254 -s 'powered by' -r -f 200
 
   # search headers only, don't follow redirects, verbose output
-  $ httpgrep -h foobar.net -s 'X-Powered-By' -S headers -F -v
+  $ httpgrep -h foobar.net -s 'X-Powered-By' -w headers -F -v
+
+  # grep for 'admin', but drop dynamic error pages (invert, case-insensitive)
+  $ httpgrep -h 192.168.0.0/24 -s admin -i -S 'error|not found' -I
 
   # route through proxy, custom UA, search for version strings
   $ httpgrep -h /tmp/hosts.txt -s 'nginx/1\\.' -P http://127.0.0.1:8080 -U 'curl/8.0'
@@ -300,6 +307,8 @@ opts = {
   'timeout': 3.0,
   'gtimeout': None,
   'case_in': False,
+  'invertstr': '',
+  'invert_case': False,
   'skip_on_hit': False,
   'rptr': False,
   'rand_order': False,
@@ -530,6 +539,27 @@ def compile_patterns(strings):
   return patterns, comb_s, comb_b
 
 
+def compile_invert(spec, case):
+  if not spec:
+    return None, None
+  raw = []
+  for s in get_strings(spec):
+    if not s:
+      continue
+    try:
+      re.compile(s, case)
+    except re.error as err:
+      log(f'skipping invalid invert regex {s!r}: {err}', 'warn')
+      continue
+    raw.append(s)
+  if not raw:
+    return None, None
+  inv_s = re.compile('|'.join(f'(?:{r})' for r in raw), case)
+  inv_b = re.compile(b'|'.join(b'(?:' + r.encode('utf-8') + b')' for r in raw),
+                     case)
+  return inv_s, inv_b
+
+
 def req_headers(vhost=None):
   h = {'User-Agent': get_user_agent()}
   h.update(opts['headers'])
@@ -566,7 +596,7 @@ def emit(url, vhost, kind, content):
 
 
 async def probe(client, url, vhost, patterns, found):
-  pats, comb_s, comb_b = patterns
+  pats, comb_s, comb_b, inv_s, inv_b = patterns
 
   if found and found['hit']:        # -1: host already matched, skip the rest
     return
@@ -593,7 +623,7 @@ async def probe(client, url, vhost, patterns, found):
         except Exception:
           pass
 
-        if body and comb_b.search(body):              # fast gate
+        if body and comb_b.search(body) and not (inv_b and inv_b.search(body)):
           for sp, bp in pats:
             m = bp.search(body)
             if m:
@@ -608,7 +638,8 @@ async def probe(client, url, vhost, patterns, found):
         for kb, vb in r.headers.raw:                  # raw -> original case
           k = kb.decode('latin-1')
           v = vb.decode('latin-1')
-          if comb_s.search(k) or comb_s.search(v):    # fast gate
+          if (comb_s.search(k) or comb_s.search(v)) and \
+             not (inv_s and (inv_s.search(k) or inv_s.search(v))):
             for sp, bp in pats:
               if sp.search(k) or sp.search(v):
                 emit(url, vhost or '', 'header', safe_text(f'{k}: {v}'))
@@ -828,7 +859,7 @@ def check_argv():
 
 def parse_cmdline(cmdline):
   try:
-    _opts, _args = getopt.getopt(cmdline, 'h:p:tTu:s:S:X:a:U:AR:C:FL:P:b:x:c:G:irz1Wl:f:vEO:VH')
+    _opts, _args = getopt.getopt(cmdline, 'h:p:tTu:s:S:w:X:a:U:AR:C:FL:P:b:x:c:G:iIrz1Wl:f:vEO:VH')
     for o, a in _opts:
       if o == '-h':
         opts['hosts'] = a
@@ -843,6 +874,8 @@ def parse_cmdline(cmdline):
       elif o == '-s':
         opts['searchstr'] = a
       elif o == '-S':
+        opts['invertstr'] = a
+      elif o == '-w':
         opts['where'] = [w.strip() for w in a.split(',')]
       elif o == '-X':
         if a == '?':
@@ -877,6 +910,8 @@ def parse_cmdline(cmdline):
         opts['filter_codes'] = [int(c) for c in a.split(',')]
       elif o == '-i':
         opts['case_in'] = re.IGNORECASE
+      elif o == '-I':
+        opts['invert_case'] = re.IGNORECASE
       elif o == '-1':
         opts['skip_on_hit'] = True
       elif o == '-r':
@@ -1052,8 +1087,9 @@ def main(cmdline):
 
   uris = list(get_uris())
   patterns = compile_patterns(get_strings(opts['searchstr']))
+  patterns = (*patterns, *compile_invert(opts['invertstr'], opts['invert_case']))
 
-  log('wait bitch, scanning', 'info')
+  log(f'wait bitch, scanning: {opts["hosts"]}', 'info')
   if opts['logfile'] and 'csv' in opts['formats']:
     # write the header only for a fresh/empty file (logfiles are append mode)
     csvp = f"{opts['logfile']}.csv"
