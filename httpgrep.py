@@ -50,7 +50,7 @@ except ImportError:
 
 
 __author__ = 'noptrix'
-__version__ = '3.0'
+__version__ = '3.1'
 __copyright__ = 'santa clause'
 __license__ = 'MIT'
 
@@ -102,8 +102,9 @@ HELP = BOLD + '''usage''' + NORM + '''
                       NOTE: hosts can also contain ':<ports>' on cmdline or in
                       file, where <ports> is a single port, comma-list or
                       range, e.g.: foo.net:8080, foo.net:80,443, 10.0.0.1:1-1024
-  -p <ports>        - port(s) to connect to: single port, comma-separated list
-                      or range, e.g.: 80, 80,443,8080, 8000-8100
+  -p <ports|file>   - port(s) to connect to: single port, comma-separated list,
+                      range, or a file with one spec per line, e.g.: 80,
+                      80,443,8080, 8000-8100, /tmp/ports.txt
                       (default: 80, or 443 when -t is given)
   -t                - force TLS/SSL on all ports. by default the scheme is
                       auto-detected per port (plain http, switching to TLS if
@@ -197,17 +198,11 @@ HELP = BOLD + '''usage''' + NORM + '''
   # search headers only, don't follow redirects, verbose output
   $ httpgrep -h foobar.net -s 'X-Powered-By' -S headers -F -v
 
-  # route through burp, custom UA, search for version strings
+  # route through proxy, custom UA, search for version strings
   $ httpgrep -h /tmp/hosts.txt -s 'nginx/1\\.' -P http://127.0.0.1:8080 -U 'curl/8.0'
 
   # scan with http basic auth, 30s timeout, random user-agent
   $ httpgrep -h foobar.net -s secret -a admin:password -c 30 -A
-
-  # extract vhosts from TLS certs across a /24 and scan them too
-  $ httpgrep -h 192.168.0.0/24 -p 443 -T -s admin
-
-  # log matches to out.txt, out.csv AND out.jsonl in one run
-  $ httpgrep -h 192.168.0.0/24 -p 80,443 -s admin -l out -O txt,csv,jsonl
 
   # only scan hosts with a valid TLS cert, log jsonl (-> found.jsonl)
   $ httpgrep -h /tmp/hosts.txt -t -s login -E -l found -O jsonl
@@ -383,6 +378,13 @@ def parse_ports(spec):
     raise ValueError(f'invalid port spec: {spec}')
 
   return result
+
+
+def ports_from_arg(spec):
+  if os.path.isfile(spec):
+    with open(spec, 'r', encoding='utf-8') as f:
+      spec = ','.join(line.strip() for line in f if line.strip())
+  return parse_ports(spec)
 
 
 def split_port(entry):
@@ -831,7 +833,7 @@ def parse_cmdline(cmdline):
       if o == '-h':
         opts['hosts'] = a
       elif o == '-p':
-        opts['ports'] = parse_ports(a)
+        opts['ports'] = ports_from_arg(a)
       elif o == '-t':
         opts['ssl'] = True
       elif o == '-T':
