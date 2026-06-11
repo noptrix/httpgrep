@@ -50,7 +50,7 @@ except ImportError:
 
 
 __author__ = 'noptrix'
-__version__ = '3.2'
+__version__ = '3.3'
 __copyright__ = 'Santa Clause'
 __license__ = 'MIT'
 
@@ -129,23 +129,25 @@ HELP = BOLD + '''usage''' + NORM + '''
   -E                - verify TLS/SSL certificates (default: no verification)
   -P <proxy>        - use proxy (format: '[http|https|socks4|socks5]://host:port')
                       (socks needs the 'httpx[socks]' / socksio package)
+  -f <codes>        - only report responses with given HTTP status codes,
+                      e.g.: '200', '200,301,302'
+  -e <codes>        - exclude responses with given HTTP status codes,
+                      e.g.: '404', '403,404,500'
 
 ''' + BOLD + '''search options''' + NORM + '''
 
   -s <str|file>     - a single string/regex or multile strings/regex in a file
                       to find in given URIs and HTTP response headers,
                       e.g.: 'tomcat 8', '/tmp/igot0daysforthese.txt'
-  -S <str|file>     - invert (grep -v): drop a match if the searched content
-                      also matches this string/regex (or file), e.g. to filter
-                      out dynamic error / not-found pages
+  -S <str|file>     - invert (grep -v): drop ALL matches of a response if this
+                      string/regex (or file) appears anywhere in its body or
+                      headers, e.g. to filter out dynamic error / 404 pages
   -w <where>        - search strings in given places (default: headers,body)
   -b <bytes>        - num bytes of context to show from a body match
                       (default: 64). NOTE: only the first 256 KB of a body
                       is read and searched (for speed)
   -i                - use case-insensitive search
   -I                - use case-insensitive invert (for -S)
-  -1                - stop scanning a host after its first match (skips its
-                      remaining uris, ports and search strings)
 
 ''' + BOLD + '''scan options''' + NORM + '''
 
@@ -155,8 +157,8 @@ HELP = BOLD + '''usage''' + NORM + '''
                       body read time (default: 3.0)
   -G <seconds>      - global timeout: hard-stop the whole scan after N seconds
                       (safety net against any hang; default: none)
-  -f <codes>        - only report responses with given HTTP status codes,
-                      e.g.: '200', '200,301,302'
+  -1                - stop scanning a host after its first match (skips its
+                      remaining uris, ports and search strings)
   -z                - scan targets in random order (for cidr-/host-range or
                       target file; loads all targets into memory first)
   -W                - save/resume: on ctrl+c write progress to httpgrep.session;
@@ -301,6 +303,7 @@ opts = {
   'no_redir': False,
   'max_redirs': 10,
   'filter_codes': [],
+  'exclude_codes': [],
   'proxy': None,
   'bytes': 64,
   'concurrency': 1000,
@@ -610,10 +613,13 @@ async def probe(client, url, vhost, patterns, found):
                              follow_redirects=not opts['no_redir']) as r:
       if opts['filter_codes'] and r.status_code not in opts['filter_codes']:
         return
+      if opts['exclude_codes'] and r.status_code in opts['exclude_codes']:
+        return
 
-      # body capped in size + total time (asyncio.timeout beats slow-drip)
-      if 'body' in opts['where']:
-        body = bytearray()
+      # read body if we search it, or if an invert pattern must be checked.
+      # capped in size + total time (asyncio.timeout beats slow-drip)
+      body = bytearray()
+      if 'body' in opts['where'] or inv_b is not None:
         try:
           async with asyncio.timeout(opts['timeout']):
             async for chunk in r.aiter_bytes(8192):
@@ -623,23 +629,29 @@ async def probe(client, url, vhost, patterns, found):
         except Exception:
           pass
 
-        if body and comb_b.search(body) and not (inv_b and inv_b.search(body)):
-          for sp, bp in pats:
-            m = bp.search(body)
-            if m:
-              snip = body[m.start():m.start()+opts['bytes']].decode('utf-8',
-                                                                    'replace')
-              emit(url, vhost or '', 'body', repr(snip))
-              if found is not None:
-                found['hit'] = True
-                return
+      # invert (-S) is response-wide: drop ALL matches if it hits body OR headers
+      if inv_b is not None:
+        hdrs = '\n'.join(f'{kb.decode("latin-1")}: {vb.decode("latin-1")}'
+                         for kb, vb in r.headers.raw)
+        if inv_b.search(body) or inv_s.search(hdrs):
+          return
+
+      if 'body' in opts['where'] and body and comb_b.search(body):
+        for sp, bp in pats:
+          m = bp.search(body)
+          if m:
+            snip = body[m.start():m.start()+opts['bytes']].decode('utf-8',
+                                                                  'replace')
+            emit(url, vhost or '', 'body', repr(snip))
+            if found is not None:
+              found['hit'] = True
+              return
 
       if 'headers' in opts['where']:
         for kb, vb in r.headers.raw:                  # raw -> original case
           k = kb.decode('latin-1')
           v = vb.decode('latin-1')
-          if (comb_s.search(k) or comb_s.search(v)) and \
-             not (inv_s and (inv_s.search(k) or inv_s.search(v))):
+          if comb_s.search(k) or comb_s.search(v):
             for sp, bp in pats:
               if sp.search(k) or sp.search(v):
                 emit(url, vhost or '', 'header', safe_text(f'{k}: {v}'))
@@ -859,7 +871,7 @@ def check_argv():
 
 def parse_cmdline(cmdline):
   try:
-    _opts, _args = getopt.getopt(cmdline, 'h:p:tTu:s:S:w:X:a:U:AR:C:FL:P:b:x:c:G:iIrz1Wl:f:vEO:VH')
+    _opts, _args = getopt.getopt(cmdline, 'h:p:tTu:s:S:w:X:a:U:AR:C:FL:P:b:x:c:G:iIrz1Wl:f:e:vEO:VH')
     for o, a in _opts:
       if o == '-h':
         opts['hosts'] = a
@@ -908,6 +920,8 @@ def parse_cmdline(cmdline):
         opts['gtimeout'] = float(a)
       elif o == '-f':
         opts['filter_codes'] = [int(c) for c in a.split(',')]
+      elif o == '-e':
+        opts['exclude_codes'] = [int(c) for c in a.split(',')]
       elif o == '-i':
         opts['case_in'] = re.IGNORECASE
       elif o == '-I':
