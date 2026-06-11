@@ -50,7 +50,7 @@ except ImportError:
 
 
 __author__ = 'noptrix'
-__version__ = '3.3'
+__version__ = '3.4'
 __copyright__ = 'Santa Clause'
 __license__ = 'MIT'
 
@@ -157,15 +157,17 @@ HELP = BOLD + '''usage''' + NORM + '''
                       body read time (default: 3.0)
   -G <seconds>      - global timeout: hard-stop the whole scan after N seconds
                       (safety net against any hang; default: none)
-  -1                - stop scanning a host after its first match (skips its
-                      remaining uris, ports and search strings)
+  -1                - once a host has a match, skip its not-yet-started probes
+                      (best-effort; in-flight requests still finish, so under
+                      high -x you may still see a few matches per host)
   -z                - scan targets in random order (for cidr-/host-range or
                       target file; loads all targets into memory first)
   -W                - save/resume: on ctrl+c write progress to httpgrep.session;
                       rerun with -W to resume from it (else start fresh)
-  -T                - pull (v)hosts from the TLS cert (CN + SAN) and scan them
-                      too: against the same target via host header AND the
-                      hostname directly. needs TLS (-t or a *443 port).
+  -T <0|1>          - pull (v)hosts from the TLS cert (CN + SAN) and scan them.
+                      0 = in-scope only (via host header on the scanned IP);
+                      1 = also scan each vhost by name (dns-resolved, MAY LEAVE
+                      the scanned scope). needs TLS (-t or a *443 port).
 
 ''' + BOLD + '''output options''' + NORM + '''
 
@@ -316,6 +318,7 @@ opts = {
   'rptr': False,
   'rand_order': False,
   'vhost': False,
+  'vhost_dns': False,
   'logfile': False,
   'verbose': False,
   'formats': ['txt'],
@@ -609,6 +612,8 @@ async def probe(client, url, vhost, patterns, found):
 
   await _sem.acquire()
   try:
+    if found and found['hit']:        # -1: a sibling hit while we waited, bail
+      return
     async with client.stream(opts['method'], url, headers=req_headers(vhost),
                              follow_redirects=not opts['no_redir']) as r:
       if opts['filter_codes'] and r.status_code not in opts['filter_codes']:
@@ -674,15 +679,10 @@ async def scan(client, host, ports, patterns, uris):
     await probe(client, host, None, patterns, found)
     return
 
-  if found is None:
-    # ports of one host run concurrently; the global _sem caps connections
-    await asyncio.gather(*(scan_port(client, host, port, patterns, uris, found)
-                           for port in ports), return_exceptions=True)
-  else:
-    for port in ports:              # -1: sequential so a hit skips the rest
-      if found['hit']:
-        break
-      await scan_port(client, host, port, patterns, uris, found)
+  # ports of one host run concurrently; the global _sem caps connections.
+  # with -1, probes that haven't started yet bail once the host has a hit
+  await asyncio.gather(*(scan_port(client, host, port, patterns, uris, found)
+                         for port in ports), return_exceptions=True)
 
 
 async def scheme_ok(client, host, port, scheme):
@@ -718,33 +718,17 @@ async def scan_port(client, host, port, patterns, uris, found):
   if opts['vhost'] and scheme == 'https':
     vhosts = [vh for vh in await cert_names(host, port) if vh != host]
 
-  if found is None:
-    await asyncio.gather(*(probe(client, build_url(scheme, host, port, u), None,
-                                 patterns, found) for u in uris),
-                         return_exceptions=True)
-    for vh in vhosts:
-      await asyncio.gather(
-        *(probe(client, build_url(scheme, host, port, u), vh, patterns, found)
-          for u in uris),
-        *(probe(client, build_url(scheme, vh, port, u), None, patterns, found)
-          for u in uris),
-        return_exceptions=True)
-  else:
-    for u in uris:                  # -1: sequential, bail on first hit
-      if found['hit']:
-        return
-      await probe(client, build_url(scheme, host, port, u), None, patterns,
-                  found)
-    for vh in vhosts:
-      for u in uris:
-        if found['hit']:
-          return
-        await probe(client, build_url(scheme, host, port, u), vh, patterns,
-                    found)
-        if found['hit']:
-          return
-        await probe(client, build_url(scheme, vh, port, u), None, patterns,
-                    found)
+  await asyncio.gather(*(probe(client, build_url(scheme, host, port, u), None,
+                               patterns, found) for u in uris),
+                       return_exceptions=True)
+  for vh in vhosts:
+    # in-scope: vhost via host header on the scanned IP
+    tasks = [probe(client, build_url(scheme, host, port, u), vh, patterns, found)
+             for u in uris]
+    if opts['vhost_dns']:           # out-of-scope: also resolve the vhost by name
+      tasks += [probe(client, build_url(scheme, vh, port, u), None, patterns,
+                      found) for u in uris]
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def build_url(scheme, host, port, uri):
@@ -871,7 +855,7 @@ def check_argv():
 
 def parse_cmdline(cmdline):
   try:
-    _opts, _args = getopt.getopt(cmdline, 'h:p:tTu:s:S:w:X:a:U:AR:C:FL:P:b:x:c:G:iIrz1Wl:f:e:vEO:VH')
+    _opts, _args = getopt.getopt(cmdline, 'h:p:tT:u:s:S:w:X:a:U:AR:C:FL:P:b:x:c:G:iIrz1Wl:f:e:vEO:VH')
     for o, a in _opts:
       if o == '-h':
         opts['hosts'] = a
@@ -880,7 +864,10 @@ def parse_cmdline(cmdline):
       elif o == '-t':
         opts['ssl'] = True
       elif o == '-T':
+        if a not in ('0', '1'):
+          log("option -T expects 0 (in-scope) or 1 (out-of-scope)", 'error')
         opts['vhost'] = True
+        opts['vhost_dns'] = a == '1'
       elif o == '-u':
         opts['uri'] = a
       elif o == '-s':
