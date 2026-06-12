@@ -50,7 +50,7 @@ except ImportError:
 
 
 __author__ = 'noptrix'
-__version__ = '3.4'
+__version__ = '3.5'
 __copyright__ = 'Santa Clause'
 __license__ = 'MIT'
 
@@ -67,8 +67,11 @@ SESSION = 'httpgrep.session'
 URL_PAD = 38
 VHOST_PAD = 28
 
-# only the first 256 KB of a body is read + searched (speed)
+# default max body bytes read + searched per response (-m overrides)
 MAX_BODY = 256 * 1024
+
+# measured ram per buffered target, used to size the -z shuffle window
+TARGET_BYTES = 140
 
 _resolver = None
 _dns_cache = {}
@@ -144,8 +147,9 @@ HELP = BOLD + '''usage''' + NORM + '''
                       headers, e.g. to filter out dynamic error / 404 pages
   -w <where>        - search strings in given places (default: headers,body)
   -b <bytes>        - num bytes of context to show from a body match
-                      (default: 64). NOTE: only the first 256 KB of a body
-                      is read and searched (for speed)
+                      (default: 64)
+  -m <size>         - max body to read + search; suffix b/kb/mb, no suffix = kb,
+                      e.g.: 512, 1mb, 262144b (default: 256kb)
   -i                - use case-insensitive search
   -I                - use case-insensitive invert (for -S)
 
@@ -160,8 +164,9 @@ HELP = BOLD + '''usage''' + NORM + '''
   -1                - once a host has a match, skip its not-yet-started probes
                       (best-effort; in-flight requests still finish, so under
                       high -x you may still see a few matches per host)
-  -z                - scan targets in random order (for cidr-/host-range or
-                      target file; loads all targets into memory first)
+  -z <size>         - scan targets in random order within a memory-bounded
+                      window of <size> ram (suffix b/kb/mb/gb), e.g.: -z 1gb.
+                      keeps huge ranges/files from exhausting memory
   -W                - save/resume: on ctrl+c write progress to httpgrep.session;
                       rerun with -W to resume from it (else start fresh)
   -T <0|1>          - pull (v)hosts from the TLS cert (CN + SAN) and scan them.
@@ -211,12 +216,6 @@ HELP = BOLD + '''usage''' + NORM + '''
 
   # route through proxy, custom UA, search for version strings
   $ httpgrep -h /tmp/hosts.txt -s 'nginx/1\\.' -P http://127.0.0.1:8080 -U 'curl/8.0'
-
-  # scan with http basic auth, 30s timeout, random user-agent
-  $ httpgrep -h foobar.net -s secret -a admin:password -c 30 -A
-
-  # only scan hosts with a valid TLS cert, log jsonl (-> found.jsonl)
-  $ httpgrep -h /tmp/hosts.txt -t -s login -E -l found -O jsonl
 
   # big resumable scan: ctrl+c saves state, rerun with -W to continue; also
   # cap the whole run at 1 hour as a hang safety net
@@ -308,6 +307,7 @@ opts = {
   'exclude_codes': [],
   'proxy': None,
   'bytes': 64,
+  'maxbody': MAX_BODY,
   'concurrency': 1000,
   'timeout': 3.0,
   'gtimeout': None,
@@ -316,7 +316,7 @@ opts = {
   'invert_case': False,
   'skip_on_hit': False,
   'rptr': False,
-  'rand_order': False,
+  'shuffle_bytes': 0,
   'vhost': False,
   'vhost_dns': False,
   'logfile': False,
@@ -364,6 +364,25 @@ def parse_kv(s):
     if len(kv) == 2:
       parsed[kv[0].strip()] = kv[1].strip()
   return parsed
+
+
+def parse_size(spec):
+  s = spec.strip().lower()
+  if s.endswith('gb'):
+    return int(s[:-2]) * 1024 * 1024 * 1024
+  if s.endswith('mb'):
+    return int(s[:-2]) * 1024 * 1024
+  if s.endswith('kb'):
+    return int(s[:-2]) * 1024
+  if s.endswith('b'):
+    return int(s[:-1])
+  if s.endswith('g'):
+    return int(s[:-1]) * 1024 * 1024 * 1024
+  if s.endswith('m'):
+    return int(s[:-1]) * 1024 * 1024
+  if s.endswith('k'):
+    return int(s[:-1]) * 1024
+  return int(s) * 1024
 
 
 def parse_ports(spec):
@@ -435,7 +454,6 @@ def is_ipv4(host):
 
 
 async def port_open(host, port):
-  # tcp preflight: skip the http request on dead ports
   try:
     async with _sem:
       _, writer = await asyncio.wait_for(asyncio.open_connection(host, port),
@@ -520,7 +538,6 @@ def get_strings(strings):
 
 
 def compile_patterns(strings):
-  # str pattern for headers, bytes pattern for body (skips charset decoding)
   patterns = []
   for s in strings:
     if not s:                           # empty pattern would match everything
@@ -604,7 +621,7 @@ def emit(url, vhost, kind, content):
 async def probe(client, url, vhost, patterns, found):
   pats, comb_s, comb_b, inv_s, inv_b = patterns
 
-  if found and found['hit']:        # -1: host already matched, skip the rest
+  if found and found['hit']:
     return
 
   if opts['verbose']:
@@ -612,7 +629,7 @@ async def probe(client, url, vhost, patterns, found):
 
   await _sem.acquire()
   try:
-    if found and found['hit']:        # -1: a sibling hit while we waited, bail
+    if found and found['hit']:
       return
     async with client.stream(opts['method'], url, headers=req_headers(vhost),
                              follow_redirects=not opts['no_redir']) as r:
@@ -621,25 +638,44 @@ async def probe(client, url, vhost, patterns, found):
       if opts['exclude_codes'] and r.status_code in opts['exclude_codes']:
         return
 
-      # read body if we search it, or if an invert pattern must be checked.
-      # capped in size + total time (asyncio.timeout beats slow-drip)
+      hit = False
       body = bytearray()
+      hdrs = '\n'.join(f'{kb.decode("latin-1")}: {vb.decode("latin-1")}'
+                       for kb, vb in r.headers.raw)
+
+      # headers first: cheap, and under -1 a header hit skips the body download
+      if inv_s is not None and inv_s.search(hdrs):
+        return
+
+      hmatches = []
+      if 'headers' in opts['where']:
+        for kb, vb in r.headers.raw:
+          k = kb.decode('latin-1')
+          v = vb.decode('latin-1')
+          if comb_s.search(k) or comb_s.search(v):   # one line per matched header
+            hmatches.append(safe_text(f'{k}: {v}'))
+
+      if hmatches and found is not None:
+        for content in hmatches:
+          emit(url, vhost or '', 'header', content)
+        found['hit'] = True
+        return
+
       if 'body' in opts['where'] or inv_b is not None:
         try:
           async with asyncio.timeout(opts['timeout']):
             async for chunk in r.aiter_bytes(8192):
               body += chunk
-              if len(body) >= MAX_BODY:
+              if len(body) >= opts['maxbody']:
                 break
         except Exception:
           pass
-
-      # invert (-S) is response-wide: drop ALL matches if it hits body OR headers
-      if inv_b is not None:
-        hdrs = '\n'.join(f'{kb.decode("latin-1")}: {vb.decode("latin-1")}'
-                         for kb, vb in r.headers.raw)
-        if inv_b.search(body) or inv_s.search(hdrs):
+        if inv_b is not None and inv_b.search(body):
           return
+
+      for content in hmatches:
+        emit(url, vhost or '', 'header', content)
+        hit = True
 
       if 'body' in opts['where'] and body and comb_b.search(body):
         for sp, bp in pats:
@@ -648,21 +684,10 @@ async def probe(client, url, vhost, patterns, found):
             snip = body[m.start():m.start()+opts['bytes']].decode('utf-8',
                                                                   'replace')
             emit(url, vhost or '', 'body', repr(snip))
-            if found is not None:
-              found['hit'] = True
-              return
+            hit = True
 
-      if 'headers' in opts['where']:
-        for kb, vb in r.headers.raw:                  # raw -> original case
-          k = kb.decode('latin-1')
-          v = vb.decode('latin-1')
-          if comb_s.search(k) or comb_s.search(v):
-            for sp, bp in pats:
-              if sp.search(k) or sp.search(v):
-                emit(url, vhost or '', 'header', safe_text(f'{k}: {v}'))
-                if found is not None:
-                  found['hit'] = True
-                  return
+      if hit and found is not None:
+        found['hit'] = True
   except Exception:
     return
   finally:
@@ -679,14 +704,12 @@ async def scan(client, host, ports, patterns, uris):
     await probe(client, host, None, patterns, found)
     return
 
-  # ports of one host run concurrently; the global _sem caps connections.
-  # with -1, probes that haven't started yet bail once the host has a hit
+  # ports of one host run concurrently; the global _sem caps connections
   await asyncio.gather(*(scan_port(client, host, port, patterns, uris, found)
                          for port in ports), return_exceptions=True)
 
 
 async def scheme_ok(client, host, port, scheme):
-  # connection probe: True if http(s) speaks here, False on protocol/tls mismatch
   try:
     async with _sem:
       await client.head(f'{scheme}://{host}:{port}/', follow_redirects=False)
@@ -822,6 +845,21 @@ def get_hosts(hosts):
   return
 
 
+def windowed_shuffle(targets, budget_bytes):
+  # -z: shuffle within a memory-bounded window so huge ranges don't blow up ram
+  window = max(1, budget_bytes // TARGET_BYTES)
+  buf = []
+  for t in targets:
+    buf.append(t)
+    if len(buf) >= window:
+      random.shuffle(buf)
+      yield from buf
+      buf = []
+  if buf:
+    random.shuffle(buf)
+    yield from buf
+
+
 def check_search_place():
   for place in opts['where']:
     if place not in ('headers', 'body'):
@@ -855,7 +893,7 @@ def check_argv():
 
 def parse_cmdline(cmdline):
   try:
-    _opts, _args = getopt.getopt(cmdline, 'h:p:tT:u:s:S:w:X:a:U:AR:C:FL:P:b:x:c:G:iIrz1Wl:f:e:vEO:VH')
+    _opts, _args = getopt.getopt(cmdline, 'h:p:tT:u:s:S:w:X:a:U:AR:C:FL:P:b:m:x:c:G:iIrz:1Wl:f:e:vEO:VH')
     for o, a in _opts:
       if o == '-h':
         opts['hosts'] = a
@@ -899,6 +937,8 @@ def parse_cmdline(cmdline):
         opts['proxy'] = a
       elif o == '-b':
         opts['bytes'] = int(a)
+      elif o == '-m':
+        opts['maxbody'] = parse_size(a)
       elif o == '-x':
         opts['concurrency'] = int(a)
       elif o == '-c':
@@ -918,7 +958,7 @@ def parse_cmdline(cmdline):
       elif o == '-r':
         opts['rptr'] = True
       elif o == '-z':
-        opts['rand_order'] = True
+        opts['shuffle_bytes'] = parse_size(a)
       elif o == '-W':
         opts['resume'] = True
       elif o == '-l':
@@ -1049,7 +1089,6 @@ def main(cmdline):
   check_argc(cmdline)
   parse_cmdline(cmdline)
 
-  # -W resume: restore the saved run's argv + done-set if a session exists
   session_argv = list(cmdline)
   done = set()
   resume_note = None       # emitted after 'game started' so order stays sane
@@ -1098,15 +1137,14 @@ def main(cmdline):
       write_log(csvp, csv_line(['url', 'vhost', 'type', 'match']))
 
   targets = get_hosts(opts['hosts'])
-  if opts['rand_order']:
-    targets = list(targets)
-    random.shuffle(targets)
+  if opts['shuffle_bytes']:
+    targets = windowed_shuffle(targets, opts['shuffle_bytes'])
 
   asyncio.run(run_scan(targets, patterns, uris, done, session_argv),
               loop_factory=uvloop.new_event_loop if uvloop else None)
 
   if opts['resume'] and os.path.isfile(SESSION):
-    os.remove(SESSION)            # finished cleanly, nothing left to resume
+    os.remove(SESSION)
 
   log('n00b n00b, game over', 'info')
 
