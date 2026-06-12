@@ -50,7 +50,7 @@ except ImportError:
 
 
 __author__ = 'noptrix'
-__version__ = '3.5'
+__version__ = '3.6'
 __copyright__ = 'Santa Clause'
 __license__ = 'MIT'
 
@@ -834,9 +834,9 @@ def get_hosts(hosts):
     if os.path.isfile(hosts):
       with open(hosts, 'r', encoding='utf-8') as f:
         for line in f:
-          line = line.rstrip()
-          if line:
-            yield from parse_target(line, expand=False)
+          line = line.strip()
+          if line and not line.startswith('#'):
+            yield from parse_target(line, expand=True)
     else:
       yield from parse_target(hosts, expand=True)
   except Exception as err:
