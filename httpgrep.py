@@ -50,7 +50,7 @@ except ImportError:
 
 
 __author__ = 'noptrix'
-__version__ = '3.6'
+__version__ = '3.7'
 __copyright__ = 'Santa Clause'
 __license__ = 'MIT'
 
@@ -72,6 +72,17 @@ MAX_BODY = 256 * 1024
 
 # measured ram per buffered target, used to size the -z shuffle window
 TARGET_BYTES = 140
+
+# -z: cap targets held in the shuffle buffer. a bigger window adds no real
+# randomization, only ram (~280mb here); emission stays incremental either way.
+WINDOW_CAP = 2_000_000
+
+# producer yields to the event loop every this many fed targets
+FEED_YIELD = 4096
+
+# cap the tcp preflight: a filtered ip (syn dropped) must not hold a concurrency
+# slot for the whole -c read timeout, or dead range blocks starve live hosts
+CONNECT_TIMEOUT = 2.0
 
 _resolver = None
 _dns_cache = {}
@@ -115,12 +126,12 @@ HELP = BOLD + '''usage''' + NORM + '''
   -u <URI|file>     - URI or comma-separated URIs or file with URIs (one per
                       line) to search given strings in, e.g.: /foobar/,
                       /foo.html, /admin,/login, /tmp/paths.txt (default: /)
-  -r                - perform reverse dns lookup for given IPv4 addresses
-                      (resolved concurrently before scanning)
+  -r                - show the reverse-dns (PTR) name of scanned IPv4s as a
+                      label; the ip stays the scan target (no scope drift)
 
 ''' + BOLD + '''http options''' + NORM + '''
 
-  -X <method>       - specify HTTP request method to use (default: get).
+  -X <method>       - HTTP request method to use, any case (default: get).
                       use '?' to list available methods.
   -a <user:pass>    - http auth credentials (format: 'user:pass')
   -U <UA>           - set custom User-Agent (default: latest ms edge, windows)
@@ -157,8 +168,9 @@ HELP = BOLD + '''usage''' + NORM + '''
 
   -x <num>          - max concurrent connections (async; default: 1000). raise
                       ulimit -n accordingly for very high values
-  -c <seconds>      - per-host connect + read timeout in seconds, also caps
-                      body read time (default: 3.0)
+  -c <seconds>      - per-host read timeout in seconds, also caps body read
+                      time. the tcp preflight is capped at 2s regardless, so
+                      filtered/dead hosts free their slot fast (default: 3.0)
   -G <seconds>      - global timeout: hard-stop the whole scan after N seconds
                       (safety net against any hang; default: none)
   -1                - once a host has a match, skip its not-yet-started probes
@@ -167,6 +179,9 @@ HELP = BOLD + '''usage''' + NORM + '''
   -z <size>         - scan targets in random order within a memory-bounded
                       window of <size> ram (suffix b/kb/mb/gb), e.g.: -z 1gb.
                       keeps huge ranges/files from exhausting memory
+  -Z <num>          - cap the -z window at <num> targets (default 2000000,
+                      ~267mb at ~140 bytes each). more = wider mixing on huge
+                      ranges, at the cost of ram and start-up buffering
   -W                - save/resume: on ctrl+c write progress to httpgrep.session;
                       rerun with -W to resume from it (else start fresh)
   -T <0|1>          - pull (v)hosts from the TLS cert (CN + SAN) and scan them.
@@ -317,6 +332,7 @@ opts = {
   'skip_on_hit': False,
   'rptr': False,
   'shuffle_bytes': 0,
+  'window_cap': WINDOW_CAP,
   'vhost': False,
   'vhost_dns': False,
   'logfile': False,
@@ -456,8 +472,9 @@ def is_ipv4(host):
 async def port_open(host, port):
   try:
     async with _sem:
-      _, writer = await asyncio.wait_for(asyncio.open_connection(host, port),
-                                         timeout=opts['timeout'])
+      _, writer = await asyncio.wait_for(
+        asyncio.open_connection(host, port),
+        timeout=min(opts['timeout'], CONNECT_TIMEOUT))
       writer.close()
       try:
         await writer.wait_closed()
@@ -539,9 +556,11 @@ def get_strings(strings):
 
 def compile_patterns(strings):
   patterns = []
+  seen = set()
   for s in strings:
-    if not s:                           # empty pattern would match everything
+    if not s or s in seen:              # empty matches everything; dups -> dup output
       continue
+    seen.add(s)
     try:
       sp = re.compile(s, opts['case_in'])
       bp = re.compile(s.encode('utf-8'), opts['case_in'])
@@ -618,8 +637,9 @@ def emit(url, vhost, kind, content):
     write_log(f"{opts['logfile']}.{fmt}", line)
 
 
-async def probe(client, url, vhost, patterns, found):
+async def probe(client, url, vhost, patterns, found, rdns=''):
   pats, comb_s, comb_b, inv_s, inv_b = patterns
+  label = vhost or rdns         # vhost = host-header target; rdns = -r ptr label
 
   if found and found['hit']:
     return
@@ -631,7 +651,8 @@ async def probe(client, url, vhost, patterns, found):
   try:
     if found and found['hit']:
       return
-    async with client.stream(opts['method'], url, headers=req_headers(vhost),
+    async with client.stream(opts['method'].upper(), url,
+                             headers=req_headers(vhost),
                              follow_redirects=not opts['no_redir']) as r:
       if opts['filter_codes'] and r.status_code not in opts['filter_codes']:
         return
@@ -657,7 +678,7 @@ async def probe(client, url, vhost, patterns, found):
 
       if hmatches and found is not None:
         for content in hmatches:
-          emit(url, vhost or '', 'header', content)
+          emit(url, label,'header', content)
         found['hit'] = True
         return
 
@@ -674,16 +695,16 @@ async def probe(client, url, vhost, patterns, found):
           return
 
       for content in hmatches:
-        emit(url, vhost or '', 'header', content)
+        emit(url, label,'header', content)
         hit = True
 
       if 'body' in opts['where'] and body and comb_b.search(body):
-        for sp, bp in pats:
+        for _, bp in pats:
           m = bp.search(body)
           if m:
             snip = body[m.start():m.start()+opts['bytes']].decode('utf-8',
                                                                   'replace')
-            emit(url, vhost or '', 'body', repr(snip))
+            emit(url, label,'body', repr(snip))
             hit = True
 
       if hit and found is not None:
@@ -695,8 +716,11 @@ async def probe(client, url, vhost, patterns, found):
 
 
 async def scan(client, host, ports, patterns, uris):
+  rdns = ''
   if opts['rptr'] and ports is not None and is_ipv4(host):
-    host = await resolve_rptr(host)
+    name = await resolve_rptr(host)   # label only; the ip stays the scan target
+    if name != host:
+      rdns = name
 
   found = {'hit': False} if opts['skip_on_hit'] else None   # -1: shared per host
 
@@ -705,7 +729,7 @@ async def scan(client, host, ports, patterns, uris):
     return
 
   # ports of one host run concurrently; the global _sem caps connections
-  await asyncio.gather(*(scan_port(client, host, port, patterns, uris, found)
+  await asyncio.gather(*(scan_port(client, host, port, patterns, uris, found, rdns)
                          for port in ports), return_exceptions=True)
 
 
@@ -729,7 +753,7 @@ async def detect_scheme(client, host, port):
   return None
 
 
-async def scan_port(client, host, port, patterns, uris, found):
+async def scan_port(client, host, port, patterns, uris, found, rdns=''):
   if not await port_open(host, port):
     return
 
@@ -742,7 +766,7 @@ async def scan_port(client, host, port, patterns, uris, found):
     vhosts = [vh for vh in await cert_names(host, port) if vh != host]
 
   await asyncio.gather(*(probe(client, build_url(scheme, host, port, u), None,
-                               patterns, found) for u in uris),
+                               patterns, found, rdns) for u in uris),
                        return_exceptions=True)
   for vh in vhosts:
     # in-scope: vhost via host header on the scanned IP
@@ -759,9 +783,10 @@ def build_url(scheme, host, port, uri):
 
 
 def format_row(url, vhost, kind, content):
-  cols = f'{url:<{URL_PAD}}'
-  if opts['vhost']:
-    cols = f'{cols} | {vhost:<{VHOST_PAD}}'
+  # url/vhost can carry attacker/file-controlled bytes; escape for the terminal
+  cols = f'{safe_text(url):<{URL_PAD}}'
+  if opts['vhost'] or opts['rptr']:
+    cols = f'{cols} | {safe_text(vhost):<{VHOST_PAD}}'
   return f'{cols} | {kind:<6} | {content}'
 
 
@@ -775,7 +800,7 @@ def csv_line(fields):
   safe = []
   for f in fields:
     f = str(f)
-    if f[:1] in ('=', '+', '-', '@', '\t'):     # neutralize csv formula injection
+    if f[:1] in ('=', '+', '-', '@', '\t', '\r'):  # neutralize csv formula injection
       f = "'" + f
     safe.append(f)
   buf = io.StringIO()
@@ -817,9 +842,11 @@ def parse_target(entry, expand):
       yield (str(ipaddr), ports)
   elif expand and '-' in host_part:
     try:
-      start = ipaddress.IPv4Address(host_part.split('-')[0])
-      end = ipaddress.IPv4Address(host_part.split('-')[1])
-      for i in range(int(start), int(end) + 1):
+      lo = int(ipaddress.IPv4Address(host_part.split('-')[0]))
+      hi = int(ipaddress.IPv4Address(host_part.split('-')[1]))
+      if lo > hi:                       # accept reversed ranges instead of nothing
+        lo, hi = hi, lo
+      for i in range(lo, hi + 1):
         yield (str(ipaddress.IPv4Address(i)), ports)
     except ValueError:
       yield (host_part, ports)
@@ -830,34 +857,28 @@ def parse_target(entry, expand):
 
 
 def get_hosts(hosts):
-  try:
-    if os.path.isfile(hosts):
-      with open(hosts, 'r', encoding='utf-8') as f:
-        for line in f:
-          line = line.strip()
-          if line and not line.startswith('#'):
-            yield from parse_target(line, expand=True)
-    else:
+  if os.path.isfile(hosts):
+    try:
+      f = open(hosts, 'r', encoding='utf-8')
+    except OSError as err:
+      log(str(err).lower(), 'error')
+      return
+    with f:
+      for line in f:
+        line = line.strip()
+        if not line or line.startswith('#'):
+          continue
+        try:
+          yield from parse_target(line, expand=True)
+        except Exception as err:      # one bad line must not kill the whole scan
+          log(f'skipping bad target {line!r}: {str(err).lower()}', 'warn')
+  else:
+    try:
       yield from parse_target(hosts, expand=True)
-  except Exception as err:
-    log(str(err).lower() or 'invalid host spec', 'error')
+    except Exception as err:
+      log(str(err).lower() or 'invalid host spec', 'error')
 
   return
-
-
-def windowed_shuffle(targets, budget_bytes):
-  # -z: shuffle within a memory-bounded window so huge ranges don't blow up ram
-  window = max(1, budget_bytes // TARGET_BYTES)
-  buf = []
-  for t in targets:
-    buf.append(t)
-    if len(buf) >= window:
-      random.shuffle(buf)
-      yield from buf
-      buf = []
-  if buf:
-    random.shuffle(buf)
-    yield from buf
 
 
 def check_search_place():
@@ -893,7 +914,7 @@ def check_argv():
 
 def parse_cmdline(cmdline):
   try:
-    _opts, _args = getopt.getopt(cmdline, 'h:p:tT:u:s:S:w:X:a:U:AR:C:FL:P:b:m:x:c:G:iIrz:1Wl:f:e:vEO:VH')
+    _opts, _args = getopt.getopt(cmdline, 'h:p:tT:u:s:S:w:X:a:U:AR:C:FL:P:b:m:x:c:G:iIrz:Z:1Wl:f:e:vEO:VH')
     for o, a in _opts:
       if o == '-h':
         opts['hosts'] = a
@@ -918,7 +939,7 @@ def parse_cmdline(cmdline):
         if a == '?':
           list_methods()
           sys.exit(SUCCESS)
-        opts['method'] = a
+        opts['method'] = a.lower()      # accept any case; sent upper on the wire
       elif o == '-a':
         opts['auth'] = tuple(a.split(':', 1))
       elif o == '-U':
@@ -959,6 +980,8 @@ def parse_cmdline(cmdline):
         opts['rptr'] = True
       elif o == '-z':
         opts['shuffle_bytes'] = parse_size(a)
+      elif o == '-Z':
+        opts['window_cap'] = int(a)
       elif o == '-W':
         opts['resume'] = True
       elif o == '-l':
@@ -983,7 +1006,8 @@ def parse_cmdline(cmdline):
         log(HELP)
         sys.exit(SUCCESS)
   except (getopt.GetoptError, ValueError) as err:
-    log(err.args[0].lower(), 'error')
+    msg = str(err.args[0]) if err.args else str(err)
+    log(msg.lower() or 'invalid argument', 'error')
 
   return
 
@@ -999,7 +1023,7 @@ def check_fd_limit(concurrency):
   # async opens many sockets at once; make sure the open-file limit covers it
   try:
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    need = concurrency * 2 + 64                  # ~preflight + http fd per worker
+    need = concurrency * 2 + 64
     if soft < need:
       try:
         resource.setrlimit(resource.RLIMIT_NOFILE, (min(need, hard), hard))
@@ -1074,10 +1098,44 @@ async def run_scan(targets, patterns, uris, done, session_argv):
         queue.task_done()
 
   workers = [asyncio.create_task(worker()) for _ in range(n)]
-  for host, ports in targets:
+
+  window = 0
+  if opts['shuffle_bytes']:
+    cap = opts['window_cap']
+    window = min(max(1, opts['shuffle_bytes'] // TARGET_BYTES), cap)
+    if opts['shuffle_bytes'] // TARGET_BYTES > cap:
+      log(f'-z window capped at {cap} targets '
+          f'(~{cap * TARGET_BYTES // (1024 * 1024)}mb); raise -Z to buffer more',
+          'info')
+
+  async def feed(host, ports):
     if opts['resume'] and f'{host}|{ports}' in done:
-      continue
+      return
     await queue.put((host, ports))
+
+  pulled = 0
+  buf = []
+  for host, ports in targets:
+    if window and len(buf) < window:
+      buf.append((host, ports))
+    elif window:
+      j = random.randrange(window)
+      out = buf[j]
+      buf[j] = (host, ports)
+      await feed(*out)
+    else:
+      await feed(host, ports)
+    pulled += 1
+    if pulled % FEED_YIELD == 0:
+      await asyncio.sleep(0)
+  while buf:                       # drain remainder, still in random order
+    j = random.randrange(len(buf))
+    buf[j], buf[-1] = buf[-1], buf[j]
+    await feed(*buf.pop())
+    pulled += 1
+    if pulled % FEED_YIELD == 0:
+      await asyncio.sleep(0)
+
   for _ in range(n):
     await queue.put(None)
   await asyncio.gather(*workers)
@@ -1116,6 +1174,21 @@ def main(cmdline):
   if opts['concurrency'] < 1:
     log('concurrency (-x) must be >= 1', 'error')
 
+  if opts['window_cap'] < 1:
+    log('shuffle window cap (-Z) must be >= 1', 'error')
+
+  if opts['maxbody'] < 1:
+    log('max body (-m) must be >= 1', 'error')
+
+  if opts['bytes'] < 1:
+    log('context bytes (-b) must be >= 1', 'error')
+
+  if opts['timeout'] <= 0:
+    log('timeout (-c) must be > 0', 'error')
+
+  if opts['gtimeout'] is not None and opts['gtimeout'] <= 0:
+    log('global timeout (-G) must be > 0', 'error')
+
   if opts['max_redirs'] < 0:
     log('max redirects (-L) must be >= 0', 'error')
 
@@ -1137,8 +1210,6 @@ def main(cmdline):
       write_log(csvp, csv_line(['url', 'vhost', 'type', 'match']))
 
   targets = get_hosts(opts['hosts'])
-  if opts['shuffle_bytes']:
-    targets = windowed_shuffle(targets, opts['shuffle_bytes'])
 
   asyncio.run(run_scan(targets, patterns, uris, done, session_argv),
               loop_factory=uvloop.new_event_loop if uvloop else None)
