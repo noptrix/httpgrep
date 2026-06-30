@@ -57,7 +57,7 @@ except ImportError:
 
 
 __author__ = 'noptrix'
-__version__ = '4.0'
+__version__ = '4.1'
 __copyright__ = 'Santa Clause'
 __license__ = 'MIT'
 
@@ -179,7 +179,7 @@ HELP = BOLD + '''usage''' + NORM + '''
 
 ''' + BOLD + '''scan options''' + NORM + '''
 
-  -x <num>          - max concurrent connections (async; default: 1000). raise
+  -x <num>          - max concurrent connections (async; default: 300). raise
                       ulimit -n accordingly for very high values
   -c <seconds>      - per-host read timeout in seconds, also caps body read
                       time. the tcp preflight is capped at 2s regardless, so
@@ -342,7 +342,7 @@ opts = {
   'proxy': None,
   'bytes': 64,
   'maxbody': MAX_BODY,
-  'concurrency': 1000,
+  'concurrency': 300,
   'timeout': 3.0,
   'gtimeout': None,
   'case_in': False,
@@ -753,12 +753,13 @@ async def probe(client, url, vhost, patterns, found, rdns=''):
   try:
     for _ in range(opts['retries'] + 1):
       if found and found['hit']:
-        return
+        return True
       try:
         await _once()
-        return
+        return True
       except Exception:
         pass
+    return False
   finally:
     _sem.release()
 
@@ -776,15 +777,16 @@ async def scan(client, host, ports, patterns, uris):
     parts = urllib.parse.urlsplit(host)
     pf_port = parts.port or (443 if parts.scheme == 'https' else 80)
     if parts.hostname and not await port_open(parts.hostname, pf_port):
-      return
-    await asyncio.gather(*(probe(client, u, None, patterns, found)
-                           for u in url_targets(host, uris)),
-                         return_exceptions=True)
-    return
+      return False                  # unreachable -> not "done", retry on -W resume
+    res = await asyncio.gather(*(probe(client, u, None, patterns, found)
+                                 for u in url_targets(host, uris)),
+                               return_exceptions=True)
+    return any(r is True for r in res)
 
   # ports of one host run concurrently; the global _sem caps connections
-  await asyncio.gather(*(scan_port(client, host, port, patterns, uris, found, rdns)
-                         for port in ports), return_exceptions=True)
+  res = await asyncio.gather(*(scan_port(client, host, port, patterns, uris, found, rdns)
+                               for port in ports), return_exceptions=True)
+  return any(r is True for r in res)
 
 
 async def scheme_ok(client, host, port, scheme):
@@ -809,11 +811,11 @@ async def detect_scheme(client, host, port):
 
 async def scan_port(client, host, port, patterns, uris, found, rdns=''):
   if not await port_open(host, port):
-    return
+    return False
 
   scheme = await detect_scheme(client, host, port)
-  if scheme is None:                # open but speaks neither http nor https
-    return
+  if scheme is None:
+    return True
 
   vhosts = []
   if opts['vhost'] and scheme == 'https':
@@ -826,10 +828,11 @@ async def scan_port(client, host, port, patterns, uris, found, rdns=''):
     # in-scope: vhost via host header on the scanned IP
     tasks = [probe(client, build_url(scheme, host, port, u), vh, patterns, found)
              for u in uris]
-    if opts['vhost_dns']:           # out-of-scope: also resolve the vhost by name
+    if opts['vhost_dns']:
       tasks += [probe(client, build_url(scheme, vh, port, u), None, patterns,
                       found) for u in uris]
     await asyncio.gather(*tasks, return_exceptions=True)
+  return True
 
 
 def build_url(scheme, host, port, uri):
@@ -837,10 +840,10 @@ def build_url(scheme, host, port, uri):
 
 
 def url_targets(url, uris):
-  if uris == ['/']:                 # no -u given -> scan the url exactly as-is
+  if uris == ['/']:
     return [url]
   parts = urllib.parse.urlsplit(url)
-  base = f'{parts.scheme}://{parts.netloc}'
+  base = f'{parts.scheme}://{parts.netloc}{parts.path.rstrip("/")}'
   return [base + u for u in uris]
 
 
@@ -1165,8 +1168,8 @@ async def run_scan(targets, patterns, uris, done, session_argv):
         return
       host, ports = item
       try:
-        await scan(client, host, ports, patterns, uris)
-        if opts['resume']:
+        reached = await scan(client, host, ports, patterns, uris)
+        if opts['resume'] and reached:
           done.add(f'{host}|{ports}')
       except Exception:
         pass
