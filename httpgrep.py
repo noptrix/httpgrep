@@ -36,6 +36,7 @@ import resource
 import asyncio
 import warnings
 import getopt
+import urllib.parse
 import httpx
 
 try:
@@ -50,7 +51,7 @@ except ImportError:
 
 
 __author__ = 'noptrix'
-__version__ = '3.7'
+__version__ = '3.8'
 __copyright__ = 'Santa Clause'
 __license__ = 'MIT'
 
@@ -554,11 +555,24 @@ def get_strings(strings):
   return
 
 
+def neutral_groups(src):
+  # named groups would clash when patterns are merged into one gate alternation
+  return re.sub(r'\(\?P<[^>]*>', '(?:', src)
+
+
+def combined_regex(sources, flags):
+  gate = '|'.join(f'(?:{neutral_groups(s)})' for s in sources)
+  try:
+    return re.compile(gate, flags), re.compile(gate.encode('utf-8'), flags)
+  except re.error:
+    return None, None
+
+
 def compile_patterns(strings):
   patterns = []
   seen = set()
   for s in strings:
-    if not s or s in seen:              # empty matches everything; dups -> dup output
+    if not s or s in seen:
       continue
     seen.add(s)
     try:
@@ -573,10 +587,10 @@ def compile_patterns(strings):
     log('no valid search strings given', 'error')
 
   # fast gate: one combined search; the per-pattern loop only runs on a hit
-  raw = [sp.pattern for sp, bp in patterns]
-  comb_s = re.compile('|'.join(f'(?:{r})' for r in raw), opts['case_in'])
-  comb_b = re.compile(b'|'.join(b'(?:' + r.encode('utf-8') + b')' for r in raw),
-                      opts['case_in'])
+  comb_s, comb_b = combined_regex([sp.pattern for sp, bp in patterns],
+                                  opts['case_in'])
+  if comb_s is None:
+    comb_s, comb_b = re.compile(''), re.compile(b'')
 
   return patterns, comb_s, comb_b
 
@@ -596,9 +610,9 @@ def compile_invert(spec, case):
     raw.append(s)
   if not raw:
     return None, None
-  inv_s = re.compile('|'.join(f'(?:{r})' for r in raw), case)
-  inv_b = re.compile(b'|'.join(b'(?:' + r.encode('utf-8') + b')' for r in raw),
-                     case)
+  inv_s, inv_b = combined_regex(raw, case)
+  if inv_s is None:
+    log('invert patterns could not be combined; -S disabled', 'warn')
   return inv_s, inv_b
 
 
@@ -639,7 +653,7 @@ def emit(url, vhost, kind, content):
 
 async def probe(client, url, vhost, patterns, found, rdns=''):
   pats, comb_s, comb_b, inv_s, inv_b = patterns
-  label = vhost or rdns         # vhost = host-header target; rdns = -r ptr label
+  label = vhost or rdns
 
   if found and found['hit']:
     return
@@ -718,14 +732,16 @@ async def probe(client, url, vhost, patterns, found, rdns=''):
 async def scan(client, host, ports, patterns, uris):
   rdns = ''
   if opts['rptr'] and ports is not None and is_ipv4(host):
-    name = await resolve_rptr(host)   # label only; the ip stays the scan target
+    name = await resolve_rptr(host)
     if name != host:
       rdns = name
 
   found = {'hit': False} if opts['skip_on_hit'] else None   # -1: shared per host
 
-  if ports is None:                 # full url given as-is
-    await probe(client, host, None, patterns, found)
+  if ports is None:                 # full url given via -h
+    await asyncio.gather(*(probe(client, u, None, patterns, found)
+                           for u in url_targets(host, uris)),
+                         return_exceptions=True)
     return
 
   # ports of one host run concurrently; the global _sem caps connections
@@ -782,8 +798,15 @@ def build_url(scheme, host, port, uri):
   return f'{scheme}://{host}:{port}{uri}'
 
 
+def url_targets(url, uris):
+  if uris == ['/']:                 # no -u given -> scan the url exactly as-is
+    return [url]
+  parts = urllib.parse.urlsplit(url)
+  base = f'{parts.scheme}://{parts.netloc}'
+  return [base + u for u in uris]
+
+
 def format_row(url, vhost, kind, content):
-  # url/vhost can carry attacker/file-controlled bytes; escape for the terminal
   cols = f'{safe_text(url):<{URL_PAD}}'
   if opts['vhost'] or opts['rptr']:
     cols = f'{cols} | {safe_text(vhost):<{VHOST_PAD}}'
@@ -844,7 +867,7 @@ def parse_target(entry, expand):
     try:
       lo = int(ipaddress.IPv4Address(host_part.split('-')[0]))
       hi = int(ipaddress.IPv4Address(host_part.split('-')[1]))
-      if lo > hi:                       # accept reversed ranges instead of nothing
+      if lo > hi:
         lo, hi = hi, lo
       for i in range(lo, hi + 1):
         yield (str(ipaddress.IPv4Address(i)), ports)
@@ -870,7 +893,7 @@ def get_hosts(hosts):
           continue
         try:
           yield from parse_target(line, expand=True)
-        except Exception as err:      # one bad line must not kill the whole scan
+        except Exception as err:
           log(f'skipping bad target {line!r}: {str(err).lower()}', 'warn')
   else:
     try:
@@ -912,6 +935,13 @@ def check_argv():
   return
 
 
+def argv_value(argv, flag):
+  for i, a in enumerate(argv):
+    if a == flag and i + 1 < len(argv):
+      return argv[i + 1]
+  return None
+
+
 def parse_cmdline(cmdline):
   try:
     _opts, _args = getopt.getopt(cmdline, 'h:p:tT:u:s:S:w:X:a:U:AR:C:FL:P:b:m:x:c:G:iIrz:Z:1Wl:f:e:vEO:VH')
@@ -939,7 +969,7 @@ def parse_cmdline(cmdline):
         if a == '?':
           list_methods()
           sys.exit(SUCCESS)
-        opts['method'] = a.lower()      # accept any case; sent upper on the wire
+        opts['method'] = a.lower()
       elif o == '-a':
         opts['auth'] = tuple(a.split(':', 1))
       elif o == '-U':
@@ -1154,12 +1184,20 @@ def main(cmdline):
     try:
       with open(SESSION, encoding='utf-8') as f:
         saved = json.load(f)
-      session_argv = saved['argv']
-      parse_cmdline(session_argv)
-      opts['resume'] = True
-      done = set(saved['done'])
-      resume_note = ('info', f'resuming {SESSION}: {len(done)} targets '
-                     'already done')
+      saved_argv = saved['argv']
+      saved_h = argv_value(saved_argv, '-h')
+      # only resume a session that belongs to the current -h (or none given)
+      if opts['hosts'] is not None and opts['hosts'] != saved_h:
+        resume_note = ('warn', f'{SESSION} is from another scan (-h {saved_h!r}); '
+                       f'ignoring it and scanning {opts["hosts"]!r} fresh '
+                       '(rm it to silence)')
+      else:
+        session_argv = saved_argv
+        parse_cmdline(session_argv)
+        opts['resume'] = True
+        done = set(saved['done'])
+        resume_note = ('info', f'resuming {SESSION}: {len(done)} targets '
+                       'already done')
     except Exception as err:
       resume_note = ('warn', f'could not read {SESSION} ({err}); starting fresh')
 
