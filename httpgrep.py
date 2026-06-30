@@ -51,7 +51,7 @@ except ImportError:
 
 
 __author__ = 'noptrix'
-__version__ = '3.8'
+__version__ = '3.9'
 __copyright__ = 'Santa Clause'
 __license__ = 'MIT'
 
@@ -198,6 +198,8 @@ HELP = BOLD + '''usage''' + NORM + '''
                       (default: txt; use '?' to list). terminal output always
                       stays human-readable.
   -v                - verbose: print each url as it gets scanned
+  -7                - escape non-ASCII in terminal output to \\xNN, so a hostile
+                      response body can't corrupt your terminal (logs stay raw)
 
 ''' + BOLD + '''misc options''' + NORM + '''
 
@@ -338,6 +340,7 @@ opts = {
   'vhost_dns': False,
   'logfile': False,
   'verbose': False,
+  'asciisafe': False,
   'formats': ['txt'],
   'verify': False,
   'resume': False,
@@ -637,7 +640,9 @@ def write_log(path, line):
 def emit(url, vhost, kind, content):
   pretty = format_row(url, vhost, kind, content)
 
-  log(pretty, 'good')
+  term = pretty.encode('ascii', 'backslashreplace').decode() if opts['asciisafe'] \
+      else pretty
+  log(term, 'good')
   if not opts['logfile']:
     return
   for fmt in opts['formats']:
@@ -739,6 +744,10 @@ async def scan(client, host, ports, patterns, uris):
   found = {'hit': False} if opts['skip_on_hit'] else None   # -1: shared per host
 
   if ports is None:                 # full url given via -h
+    parts = urllib.parse.urlsplit(host)
+    pf_port = parts.port or (443 if parts.scheme == 'https' else 80)
+    if parts.hostname and not await port_open(parts.hostname, pf_port):
+      return
     await asyncio.gather(*(probe(client, u, None, patterns, found)
                            for u in url_targets(host, uris)),
                          return_exceptions=True)
@@ -944,7 +953,7 @@ def argv_value(argv, flag):
 
 def parse_cmdline(cmdline):
   try:
-    _opts, _args = getopt.getopt(cmdline, 'h:p:tT:u:s:S:w:X:a:U:AR:C:FL:P:b:m:x:c:G:iIrz:Z:1Wl:f:e:vEO:VH')
+    _opts, _args = getopt.getopt(cmdline, 'h:p:tT:u:s:S:w:X:a:U:AR:C:FL:P:b:m:x:c:G:iIrz:Z:1Wl:f:e:v7EO:VH')
     for o, a in _opts:
       if o == '-h':
         opts['hosts'] = a
@@ -1018,6 +1027,8 @@ def parse_cmdline(cmdline):
         opts['logfile'] = a
       elif o == '-v':
         opts['verbose'] = True
+      elif o == '-7':
+        opts['asciisafe'] = True
       elif o == '-E':
         opts['verify'] = True
       elif o == '-O':
@@ -1099,11 +1110,10 @@ async def run_scan(targets, patterns, uris, done, session_argv):
     loop.call_later(opts['gtimeout'], abort,
                     f'global timeout ({opts["gtimeout"]}s) reached, stopping')
 
-  # no keep-alive: partial reads (body-cap/header-skip) make pooling slower here
   try:
     client = httpx.AsyncClient(
       verify=opts['verify'], timeout=httpx.Timeout(opts['timeout']),
-      limits=httpx.Limits(max_connections=n, max_keepalive_connections=0),
+      limits=httpx.Limits(max_connections=n, max_keepalive_connections=n),
       auth=opts['auth'] or None, cookies=opts['cookies'] or None,
       max_redirects=opts['max_redirs'], proxy=opts['proxy'] or None)
   except Exception as err:
