@@ -26,6 +26,7 @@ import csv
 import io
 import json
 import socket
+import struct
 import ssl
 import tempfile
 import ipaddress
@@ -49,9 +50,14 @@ try:
 except ImportError:
   aiodns = None
 
+try:
+  import h2 as _h2
+except ImportError:
+  _h2 = None
+
 
 __author__ = 'noptrix'
-__version__ = '3.9'
+__version__ = '4.0'
 __copyright__ = 'Santa Clause'
 __license__ = 'MIT'
 
@@ -84,6 +90,10 @@ FEED_YIELD = 4096
 # cap the tcp preflight: a filtered ip (syn dropped) must not hold a concurrency
 # slot for the whole -c read timeout, or dead range blocks starve live hosts
 CONNECT_TIMEOUT = 2.0
+
+# close with RST instead of FIN -> sockets are freed at once, no FIN_WAIT_1/
+# TIME_WAIT pileup that would exhaust fds/ports over a long scan
+SO_LINGER_RST = (socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
 
 _resolver = None
 _dns_cache = {}
@@ -148,6 +158,8 @@ HELP = BOLD + '''usage''' + NORM + '''
                       e.g.: '200', '200,301,302'
   -e <codes>        - exclude responses with given HTTP status codes,
                       e.g.: '404', '403,404,500'
+  -2                - try HTTP/2 (ALPN-negotiated on TLS, falls back to 1.1;
+                      plain http stays 1.1). needs the 'h2' package
 
 ''' + BOLD + '''search options''' + NORM + '''
 
@@ -174,6 +186,8 @@ HELP = BOLD + '''usage''' + NORM + '''
                       filtered/dead hosts free their slot fast (default: 3.0)
   -G <seconds>      - global timeout: hard-stop the whole scan after N seconds
                       (safety net against any hang; default: none)
+  -y <num>          - retry a failed probe up to <num> times (default: 0).
+                      helps with flaky hosts at scale; keep it small
   -1                - once a host has a match, skip its not-yet-started probes
                       (best-effort; in-flight requests still finish, so under
                       high -x you may still see a few matches per host)
@@ -317,6 +331,8 @@ opts = {
   'auth': False,
   'ua': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0',
   'rand_agent': False,
+  'http2': False,
+  'retries': 0,
   'headers': {},
   'cookies': {},
   'no_redir': False,
@@ -479,6 +495,12 @@ async def port_open(host, port):
       _, writer = await asyncio.wait_for(
         asyncio.open_connection(host, port),
         timeout=min(opts['timeout'], CONNECT_TIMEOUT))
+      sock = writer.get_extra_info('socket')
+      if sock is not None:
+        try:
+          sock.setsockopt(*SO_LINGER_RST)
+        except Exception:
+          pass
       writer.close()
       try:
         await writer.wait_closed()
@@ -637,8 +659,8 @@ def write_log(path, line):
     log(f'could not write to logfile {path}', 'warn')
 
 
-def emit(url, vhost, kind, content):
-  pretty = format_row(url, vhost, kind, content)
+def emit(url, vhost, status, kind, content):
+  pretty = format_row(url, vhost, status, kind, content)
 
   term = pretty.encode('ascii', 'backslashreplace').decode() if opts['asciisafe'] \
       else pretty
@@ -647,10 +669,10 @@ def emit(url, vhost, kind, content):
     return
   for fmt in opts['formats']:
     if fmt == 'csv':
-      line = csv_line([url, vhost, kind, content])
+      line = csv_line([url, vhost, status, kind, content])
     elif fmt == 'jsonl':
-      line = json.dumps({'url': url, 'vhost': vhost, 'type': kind,
-                         'match': content})
+      line = json.dumps({'url': url, 'vhost': vhost, 'status': status,
+                         'type': kind, 'match': content})
     else:
       line = pretty
     write_log(f"{opts['logfile']}.{fmt}", line)
@@ -666,13 +688,11 @@ async def probe(client, url, vhost, patterns, found, rdns=''):
   if opts['verbose']:
     log(f'scanning {url}', 'verbose')
 
-  await _sem.acquire()
-  try:
-    if found and found['hit']:
-      return
+  async def _once():
     async with client.stream(opts['method'].upper(), url,
                              headers=req_headers(vhost),
                              follow_redirects=not opts['no_redir']) as r:
+      status = r.status_code
       if opts['filter_codes'] and r.status_code not in opts['filter_codes']:
         return
       if opts['exclude_codes'] and r.status_code in opts['exclude_codes']:
@@ -697,7 +717,7 @@ async def probe(client, url, vhost, patterns, found, rdns=''):
 
       if hmatches and found is not None:
         for content in hmatches:
-          emit(url, label,'header', content)
+          emit(url, label, status, 'header', content)
         found['hit'] = True
         return
 
@@ -714,7 +734,7 @@ async def probe(client, url, vhost, patterns, found, rdns=''):
           return
 
       for content in hmatches:
-        emit(url, label,'header', content)
+        emit(url, label, status, 'header', content)
         hit = True
 
       if 'body' in opts['where'] and body and comb_b.search(body):
@@ -723,13 +743,22 @@ async def probe(client, url, vhost, patterns, found, rdns=''):
           if m:
             snip = body[m.start():m.start()+opts['bytes']].decode('utf-8',
                                                                   'replace')
-            emit(url, label,'body', repr(snip))
+            emit(url, label, status, 'body', repr(snip))
             hit = True
 
       if hit and found is not None:
         found['hit'] = True
-  except Exception:
-    return
+
+  await _sem.acquire()
+  try:
+    for _ in range(opts['retries'] + 1):
+      if found and found['hit']:
+        return
+      try:
+        await _once()
+        return
+      except Exception:
+        pass
   finally:
     _sem.release()
 
@@ -815,11 +844,11 @@ def url_targets(url, uris):
   return [base + u for u in uris]
 
 
-def format_row(url, vhost, kind, content):
+def format_row(url, vhost, status, kind, content):
   cols = f'{safe_text(url):<{URL_PAD}}'
   if opts['vhost'] or opts['rptr']:
     cols = f'{cols} | {safe_text(vhost):<{VHOST_PAD}}'
-  return f'{cols} | {kind:<6} | {content}'
+  return f'{cols} | {status:<3} | {kind:<6} | {content}'
 
 
 def safe_text(s):
@@ -953,7 +982,7 @@ def argv_value(argv, flag):
 
 def parse_cmdline(cmdline):
   try:
-    _opts, _args = getopt.getopt(cmdline, 'h:p:tT:u:s:S:w:X:a:U:AR:C:FL:P:b:m:x:c:G:iIrz:Z:1Wl:f:e:v7EO:VH')
+    _opts, _args = getopt.getopt(cmdline, 'h:p:tT:u:s:S:w:X:a:U:AR:C:FL:P:b:m:x:c:G:iIrz:Z:1Wl:f:e:v72y:EO:VH')
     for o, a in _opts:
       if o == '-h':
         opts['hosts'] = a
@@ -985,6 +1014,10 @@ def parse_cmdline(cmdline):
         opts['ua'] = a
       elif o == '-A':
         opts['rand_agent'] = True
+      elif o == '-2':
+        opts['http2'] = True
+      elif o == '-y':
+        opts['retries'] = int(a)
       elif o == '-R':
         opts['headers'].update(parse_kv(a))
       elif o == '-C':
@@ -1111,11 +1144,14 @@ async def run_scan(targets, patterns, uris, done, session_argv):
                     f'global timeout ({opts["gtimeout"]}s) reached, stopping')
 
   try:
-    client = httpx.AsyncClient(
-      verify=opts['verify'], timeout=httpx.Timeout(opts['timeout']),
+    transport = httpx.AsyncHTTPTransport(
+      verify=opts['verify'], http2=opts['http2'],
       limits=httpx.Limits(max_connections=n, max_keepalive_connections=n),
+      proxy=opts['proxy'] or None, socket_options=[SO_LINGER_RST])
+    client = httpx.AsyncClient(
+      transport=transport, timeout=httpx.Timeout(opts['timeout']),
       auth=opts['auth'] or None, cookies=opts['cookies'] or None,
-      max_redirects=opts['max_redirs'], proxy=opts['proxy'] or None)
+      max_redirects=opts['max_redirs'])
   except Exception as err:
     log(f'bad proxy / client config: {err}', 'error')
 
@@ -1146,7 +1182,7 @@ async def run_scan(targets, patterns, uris, done, session_argv):
     if opts['shuffle_bytes'] // TARGET_BYTES > cap:
       log(f'-z window capped at {cap} targets '
           f'(~{cap * TARGET_BYTES // (1024 * 1024)}mb); raise -Z to buffer more',
-          'info')
+          'warn')
 
   async def feed(host, ports):
     if opts['resume'] and f'{host}|{ports}' in done:
@@ -1240,6 +1276,13 @@ def main(cmdline):
   if opts['max_redirs'] < 0:
     log('max redirects (-L) must be >= 0', 'error')
 
+  if opts['retries'] < 0:
+    log('retries (-y) must be >= 0', 'error')
+
+  if opts['http2'] and _h2 is None:
+    log('-2 needs the h2 package; continuing with http/1.1', 'warn')
+    opts['http2'] = False
+
   check_fd_limit(opts['concurrency'])
 
   log('w00t w00t, game started', 'info')
@@ -1255,7 +1298,7 @@ def main(cmdline):
     # write the header only for a fresh/empty file (logfiles are append mode)
     csvp = f"{opts['logfile']}.csv"
     if not os.path.isfile(csvp) or os.path.getsize(csvp) == 0:
-      write_log(csvp, csv_line(['url', 'vhost', 'type', 'match']))
+      write_log(csvp, csv_line(['url', 'vhost', 'status', 'type', 'match']))
 
   targets = get_hosts(opts['hosts'])
 
