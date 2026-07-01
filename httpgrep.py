@@ -25,8 +25,10 @@ import os
 import csv
 import io
 import json
+import queue
 import socket
 import struct
+import threading
 import ssl
 import tempfile
 import ipaddress
@@ -57,7 +59,7 @@ except ImportError:
 
 
 __author__ = 'noptrix'
-__version__ = '4.1'
+__version__ = '4.2'
 __copyright__ = 'Santa Clause'
 __license__ = 'MIT'
 
@@ -86,6 +88,13 @@ WINDOW_CAP = 2_000_000
 
 # producer yields to the event loop every this many fed targets
 FEED_YIELD = 4096
+
+BIG_BODY = 65536
+
+# drop -v lines when the writer falls this far behind; matches are never dropped
+VERBOSE_QMAX = 10000
+
+PROGRESS_EVERY = 5.0
 
 # cap the tcp preflight: a filtered ip (syn dropped) must not hold a concurrency
 # slot for the whole -c read timeout, or dead range blocks starve live hosts
@@ -659,23 +668,156 @@ def write_log(path, line):
     log(f'could not write to logfile {path}', 'warn')
 
 
-def emit(url, vhost, status, kind, content):
-  pretty = format_row(url, vhost, status, kind, content)
+_out_q = None
+_out_thread = None
 
-  term = pretty.encode('ascii', 'backslashreplace').decode() if opts['asciisafe'] \
+_scanned = 0
+_prog_stop = None
+_prog_thread = None
+
+
+def match_term(url, vhost, status, kind, content):
+  pretty = format_row(url, vhost, status, kind, content)
+  return pretty.encode('ascii', 'backslashreplace').decode() if opts['asciisafe'] \
       else pretty
-  log(term, 'good')
+
+
+def match_files(url, vhost, status, kind, content):
   if not opts['logfile']:
     return
+  pretty = format_row(url, vhost, status, kind, content)
   for fmt in opts['formats']:
+    path = f"{opts['logfile']}.{fmt}"
     if fmt == 'csv':
+      if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        write_log(path, csv_line(['url', 'vhost', 'status', 'type', 'match']))
       line = csv_line([url, vhost, status, kind, content])
     elif fmt == 'jsonl':
       line = json.dumps({'url': url, 'vhost': vhost, 'status': status,
                          'type': kind, 'match': content})
     else:
       line = pretty
-    write_log(f"{opts['logfile']}.{fmt}", line)
+    write_log(path, line)
+
+
+def _write_match(url, vhost, status, kind, content):
+  log(match_term(url, vhost, status, kind, content), 'good')
+  match_files(url, vhost, status, kind, content)
+
+
+def emit(url, vhost, status, kind, content):
+  if _out_q is not None:
+    _out_q.put(('m', url, vhost, status, kind, content))
+  else:
+    _write_match(url, vhost, status, kind, content)
+
+
+def emit_verbose(msg):
+  if _out_q is None:
+    log(msg, 'verbose')
+  elif _out_q.qsize() < VERBOSE_QMAX:
+    _out_q.put(('v', msg))
+
+
+def start_output_writer():
+  global _out_q, _out_thread
+
+  def drain(q):
+    tty = sys.stderr.isatty()
+    gpref = f'{BOLD}{GREEN}[*]{NORM}'
+    vpref = f'{BOLD}[>]{NORM}'
+    ipref = f'{BOLD}{BLUE}[+]{NORM}'
+    status = ''
+
+    def scroll(line):
+      if tty and status:
+        sys.stderr.write(f'\r\x1b[2K{line}\n{status}')
+      else:
+        sys.stderr.write(f'{line}\n')
+      sys.stderr.flush()
+
+    while True:
+      item = q.get()
+      if item is None:
+        if tty and status:
+          sys.stderr.write('\n')
+          sys.stderr.flush()
+        return
+      if item[0] == 'p':
+        status = f'{ipref} {item[1]}'
+        if tty:
+          sys.stderr.write(f'\r\x1b[2K{status}')
+          sys.stderr.flush()
+        else:
+          sys.stderr.write(f'{status}\n')
+      elif item[0] == 'v':
+        scroll(f'{vpref} {item[1]}')
+      else:
+        scroll(f'{gpref} {match_term(*item[1:])}')
+        match_files(*item[1:])
+
+  _out_q = queue.Queue()
+  _out_thread = threading.Thread(target=drain, args=(_out_q,), daemon=True)
+  _out_thread.start()
+
+
+def stop_output_writer(timeout=None):
+  global _out_q, _out_thread
+  if _out_q is not None:
+    _out_q.put(None)
+  if _out_thread is not None:
+    _out_thread.join(timeout)
+  _out_q = _out_thread = None
+
+
+def print_progress(total):
+  pct = _scanned / total * 100 if total else 0.0
+  msg = f'wait bitch, scanning: {opts["hosts"]} ({_scanned}/{total} - {pct:.2f}%)'
+  if _out_q is not None:
+    _out_q.put(('p', msg))
+  else:
+    log(msg, 'info')
+
+
+def start_progress(total):
+  global _prog_stop, _prog_thread
+  _prog_stop = threading.Event()
+  print_progress(total)
+
+  def run():
+    while not _prog_stop.wait(PROGRESS_EVERY):
+      print_progress(total)
+    print_progress(total)
+
+  _prog_thread = threading.Thread(target=run, daemon=True)
+  _prog_thread.start()
+
+
+def stop_progress():
+  global _prog_stop, _prog_thread
+  if _prog_stop is not None:
+    _prog_stop.set()
+  if _prog_thread is not None:
+    _prog_thread.join(2)
+  _prog_stop = _prog_thread = None
+
+
+def match_body(body, pats, comb_b, nbytes):
+  if not comb_b.search(body):
+    return []
+  out = []
+  for _, bp in pats:
+    m = bp.search(body)
+    if m:
+      snip = body[m.start():m.start() + nbytes].decode('utf-8', 'replace')
+      out.append(repr(snip))
+  return out
+
+
+async def run_regex(loop, body, fn):
+  if len(body) >= BIG_BODY:
+    return await loop.run_in_executor(None, fn, bytes(body))
+  return fn(body)
 
 
 async def probe(client, url, vhost, patterns, found, rdns=''):
@@ -686,7 +828,7 @@ async def probe(client, url, vhost, patterns, found, rdns=''):
     return
 
   if opts['verbose']:
-    log(f'scanning {url}', 'verbose')
+    emit_verbose(f'scanning {url}')
 
   async def _once():
     async with client.stream(opts['method'].upper(), url,
@@ -721,6 +863,7 @@ async def probe(client, url, vhost, patterns, found, rdns=''):
         found['hit'] = True
         return
 
+      loop = asyncio.get_running_loop()
       if 'body' in opts['where'] or inv_b is not None:
         try:
           async with asyncio.timeout(opts['timeout']):
@@ -730,21 +873,19 @@ async def probe(client, url, vhost, patterns, found, rdns=''):
                 break
         except Exception:
           pass
-        if inv_b is not None and inv_b.search(body):
+        if inv_b is not None and body and \
+            await run_regex(loop, body, inv_b.search):
           return
 
       for content in hmatches:
         emit(url, label, status, 'header', content)
         hit = True
 
-      if 'body' in opts['where'] and body and comb_b.search(body):
-        for _, bp in pats:
-          m = bp.search(body)
-          if m:
-            snip = body[m.start():m.start()+opts['bytes']].decode('utf-8',
-                                                                  'replace')
-            emit(url, label, status, 'body', repr(snip))
-            hit = True
+      if 'body' in opts['where'] and body:
+        for snip in await run_regex(
+            loop, body, lambda b: match_body(b, pats, comb_b, opts['bytes'])):
+          emit(url, label, status, 'body', snip)
+          hit = True
 
       if hit and found is not None:
         found['hit'] = True
@@ -945,6 +1086,43 @@ def get_hosts(hosts):
   return
 
 
+def entry_targets(entry):
+  entry = entry.strip()
+  if not entry or entry.startswith('#'):
+    return 0
+  if '://' in entry:
+    return 1
+  h, sep, _ = entry.rpartition(':')
+  host_part = h if sep else entry
+  if '/' in host_part:
+    try:
+      net = ipaddress.IPv4Network(host_part, strict=False)
+    except Exception:
+      return 0
+    return net.num_addresses if net.prefixlen >= 31 else net.num_addresses - 2
+  if '-' in host_part:
+    try:
+      lo = int(ipaddress.IPv4Address(host_part.split('-')[0]))
+      hi = int(ipaddress.IPv4Address(host_part.split('-')[1]))
+      return abs(hi - lo) + 1
+    except Exception:
+      return 1
+  return 1
+
+
+def count_targets(hosts):
+  if not os.path.isfile(hosts):
+    return entry_targets(hosts)
+  total = 0
+  try:
+    with open(hosts, 'r', encoding='utf-8') as f:
+      for line in f:
+        total += entry_targets(line)
+  except OSError:
+    return 0
+  return total
+
+
 def check_search_place():
   for place in opts['where']:
     if place not in ('headers', 'body'):
@@ -1114,10 +1292,11 @@ def check_fd_limit(concurrency):
     pass
 
 
-async def run_scan(targets, patterns, uris, done, session_argv):
+async def run_scan(targets, patterns, uris, done, session_argv, total=0):
   n = opts['concurrency']
 
-  global _resolver, _sem
+  global _resolver, _sem, _scanned
+  _scanned = len(done)
   _sem = asyncio.Semaphore(n)
   if aiodns:
     try:
@@ -1126,6 +1305,7 @@ async def run_scan(targets, patterns, uris, done, session_argv):
       _resolver = None
 
   def abort(reason):
+    stop_output_writer(2)
     if opts['resume']:
       log(f'{reason}; saving session', 'warn')
       try:
@@ -1158,13 +1338,17 @@ async def run_scan(targets, patterns, uris, done, session_argv):
   except Exception as err:
     log(f'bad proxy / client config: {err}', 'error')
 
-  queue = asyncio.Queue(maxsize=n * 2)             # bounded -> back-pressure
+  start_output_writer()
+  if total >= 2:
+    start_progress(total)
+  work_q = asyncio.Queue(maxsize=n * 2)             # bounded -> back-pressure
 
   async def worker():
+    global _scanned
     while True:
-      item = await queue.get()
+      item = await work_q.get()
       if item is None:
-        queue.task_done()
+        work_q.task_done()
         return
       host, ports = item
       try:
@@ -1174,7 +1358,8 @@ async def run_scan(targets, patterns, uris, done, session_argv):
       except Exception:
         pass
       finally:
-        queue.task_done()
+        _scanned += 1
+        work_q.task_done()
 
   workers = [asyncio.create_task(worker()) for _ in range(n)]
 
@@ -1190,7 +1375,7 @@ async def run_scan(targets, patterns, uris, done, session_argv):
   async def feed(host, ports):
     if opts['resume'] and f'{host}|{ports}' in done:
       return
-    await queue.put((host, ports))
+    await work_q.put((host, ports))
 
   pulled = 0
   buf = []
@@ -1216,9 +1401,11 @@ async def run_scan(targets, patterns, uris, done, session_argv):
       await asyncio.sleep(0)
 
   for _ in range(n):
-    await queue.put(None)
+    await work_q.put(None)
   await asyncio.gather(*workers)
   await client.aclose()
+  stop_progress()
+  stop_output_writer()
 
 
 def main(cmdline):
@@ -1296,16 +1483,13 @@ def main(cmdline):
   patterns = compile_patterns(get_strings(opts['searchstr']))
   patterns = (*patterns, *compile_invert(opts['invertstr'], opts['invert_case']))
 
-  log(f'wait bitch, scanning: {opts["hosts"]}', 'info')
-  if opts['logfile'] and 'csv' in opts['formats']:
-    # write the header only for a fresh/empty file (logfiles are append mode)
-    csvp = f"{opts['logfile']}.csv"
-    if not os.path.isfile(csvp) or os.path.getsize(csvp) == 0:
-      write_log(csvp, csv_line(['url', 'vhost', 'status', 'type', 'match']))
+  total = count_targets(opts['hosts'])
+  if total < 2:
+    log(f'wait bitch, scanning: {opts["hosts"]}', 'info')
 
   targets = get_hosts(opts['hosts'])
 
-  asyncio.run(run_scan(targets, patterns, uris, done, session_argv),
+  asyncio.run(run_scan(targets, patterns, uris, done, session_argv, total),
               loop_factory=uvloop.new_event_loop if uvloop else None)
 
   if opts['resume'] and os.path.isfile(SESSION):
