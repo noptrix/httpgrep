@@ -59,7 +59,7 @@ except ImportError:
 
 
 __author__ = 'noptrix'
-__version__ = '4.2'
+__version__ = '4.3'
 __copyright__ = 'Santa Clause'
 __license__ = 'MIT'
 
@@ -653,6 +653,8 @@ def compile_invert(spec, case):
 def req_headers(vhost=None):
   h = {'User-Agent': get_user_agent()}
   h.update(opts['headers'])
+  if opts['cookies']:
+    h['Cookie'] = '; '.join(f'{k}={v}' for k, v in opts['cookies'].items())
   if vhost:
     h['Host'] = vhost
   # httpx rejects non-ascii header values; send them as latin-1 bytes
@@ -831,6 +833,7 @@ async def probe(client, url, vhost, patterns, found, rdns=''):
     emit_verbose(f'scanning {url}')
 
   async def _once():
+    client.cookies.jar.clear()   # else per-host set-cookies pile up -> O(N) jar scan per request chokes the loop
     async with client.stream(opts['method'].upper(), url,
                              headers=req_headers(vhost),
                              follow_redirects=not opts['no_redir']) as r:
@@ -1333,7 +1336,7 @@ async def run_scan(targets, patterns, uris, done, session_argv, total=0):
       proxy=opts['proxy'] or None, socket_options=[SO_LINGER_RST])
     client = httpx.AsyncClient(
       transport=transport, timeout=httpx.Timeout(opts['timeout']),
-      auth=opts['auth'] or None, cookies=opts['cookies'] or None,
+      auth=opts['auth'] or None, cookies=None,
       max_redirects=opts['max_redirs'])
   except Exception as err:
     log(f'bad proxy / client config: {err}', 'error')
