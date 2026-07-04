@@ -59,7 +59,7 @@ except ImportError:
 
 
 __author__ = 'noptrix'
-__version__ = '4.3'
+__version__ = '4.4'
 __copyright__ = 'Santa Clause'
 __license__ = 'MIT'
 
@@ -922,10 +922,20 @@ async def scan(client, host, ports, patterns, uris):
     pf_port = parts.port or (443 if parts.scheme == 'https' else 80)
     if parts.hostname and not await port_open(parts.hostname, pf_port):
       return False                  # unreachable -> not "done", retry on -W resume
+    urls = url_targets(host, uris)
     res = await asyncio.gather(*(probe(client, u, None, patterns, found)
-                                 for u in url_targets(host, uris)),
-                               return_exceptions=True)
-    return any(r is True for r in res)
+                                 for u in urls), return_exceptions=True)
+    ok = any(r is True for r in res)
+    if opts['vhost'] and parts.scheme == 'https' and parts.hostname:
+      for vh in (v for v in await cert_names(parts.hostname, pf_port)
+                 if v != parts.hostname):
+        tasks = [probe(client, u, vh, patterns, found) for u in urls]
+        if opts['vhost_dns']:      # -T 1: also hit the vhost by name
+          tasks += [probe(client, swap_host(u, vh), None, patterns, found)
+                    for u in urls]
+        r2 = await asyncio.gather(*tasks, return_exceptions=True)
+        ok = ok or any(r is True for r in r2)
+    return ok
 
   # ports of one host run concurrently; the global _sem caps connections
   res = await asyncio.gather(*(scan_port(client, host, port, patterns, uris, found, rdns)
@@ -989,6 +999,12 @@ def url_targets(url, uris):
   parts = urllib.parse.urlsplit(url)
   base = f'{parts.scheme}://{parts.netloc}{parts.path.rstrip("/")}'
   return [base + u for u in uris]
+
+
+def swap_host(url, name):
+  p = urllib.parse.urlsplit(url)
+  netloc = name + (f':{p.port}' if p.port else '')
+  return urllib.parse.urlunsplit((p.scheme, netloc, p.path, p.query, p.fragment))
 
 
 def format_row(url, vhost, status, kind, content):
