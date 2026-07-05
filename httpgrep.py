@@ -134,6 +134,8 @@ HELP = BOLD + '''usage''' + NORM + '''
   -h <hosts|file>   - single host/url or host-/cidr-range or file containing
                       hosts or file containing URLs, e.g.: foobar.net,
                       192.168.0.1-192.168.0.254, 192.168.0.0/24, /tmp/hosts.txt
+                      a comma-separated list of hosts also works, e.g.:
+                      1.2.3.4,foo.net,10.0.0.0/24
                       NOTE: hosts can also contain ':<ports>' on cmdline or in
                       file, where <ports> is a single port, comma-list or
                       range, e.g.: foo.net:8080, foo.net:80,443, 10.0.0.1:1-1024
