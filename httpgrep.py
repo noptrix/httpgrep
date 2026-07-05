@@ -59,7 +59,7 @@ except ImportError:
 
 
 __author__ = 'noptrix'
-__version__ = '4.4'
+__version__ = '4.5'
 __copyright__ = 'Santa Clause'
 __license__ = 'MIT'
 
@@ -106,6 +106,7 @@ SO_LINGER_RST = (socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
 
 _resolver = None
 _dns_cache = {}
+DNS_CACHE_MAX = 500000
 _sem = None
 
 NORM = '\033[0m'
@@ -208,10 +209,10 @@ HELP = BOLD + '''usage''' + NORM + '''
                       ranges, at the cost of ram and start-up buffering
   -W                - save/resume: on ctrl+c write progress to httpgrep.session;
                       rerun with -W to resume from it (else start fresh)
-  -T <0|1>          - pull (v)hosts from the TLS cert (CN + SAN) and scan them.
-                      0 = in-scope only (via host header on the scanned IP);
-                      1 = also scan each vhost by name (dns-resolved, MAY LEAVE
-                      the scanned scope). needs TLS (-t or a *443 port).
+  -T <0|1>          - also probe the cert (v)hosts (CN + SAN) as extra requests
+                      on top of the direct scan. 0 = via Host header on the
+                      same ip (in-scope); 1 = ALSO by dns name/SNI (may leave
+                      scope). needs TLS (https url, -t, or a *443 port).
 
 ''' + BOLD + '''output options''' + NORM + '''
 
@@ -486,6 +487,8 @@ async def resolve_rptr(host):
                                        socket.NI_NAMEREQD | socket.NI_NUMERICSERV)
   except Exception:
     name = host
+  if len(_dns_cache) >= DNS_CACHE_MAX:
+    _dns_cache.clear()
   _dns_cache[host] = name
   return name
 
@@ -595,6 +598,10 @@ def neutral_groups(src):
 
 
 def combined_regex(sources, flags):
+  # a backreference can't survive being merged into one alternation (group
+  # renumbering), so refuse to combine -> caller falls back to per-pattern
+  if any(re.search(r'\\[1-9]|\\g<|\(\?P=', s) for s in sources):
+    return None, None
   gate = '|'.join(f'(?:{neutral_groups(s)})' for s in sources)
   try:
     return re.compile(gate, flags), re.compile(gate.encode('utf-8'), flags)
@@ -620,13 +627,14 @@ def compile_patterns(strings):
   if not patterns:
     log('no valid search strings given', 'error')
 
-  # fast gate: one combined search; the per-pattern loop only runs on a hit
-  comb_s, comb_b = combined_regex([sp.pattern for sp, bp in patterns],
-                                  opts['case_in'])
-  if comb_s is None:
-    comb_s, comb_b = re.compile(''), re.compile(b'')
+  # fast body gate: one combined search; the per-pattern loop only runs on a
+  # hit. permissive (match-all) fallback when patterns can't be safely merged,
+  # so the per-pattern loop still decides -> no false negatives
+  _, comb_b = combined_regex([sp.pattern for sp, bp in patterns], opts['case_in'])
+  if comb_b is None:
+    comb_b = re.compile(b'')
 
-  return patterns, comb_s, comb_b
+  return patterns, comb_b
 
 
 def compile_invert(spec, case):
@@ -674,6 +682,7 @@ _out_q = None
 _out_thread = None
 
 _scanned = 0
+_hits = 0
 _prog_stop = None
 _prog_thread = None
 
@@ -708,6 +717,8 @@ def _write_match(url, vhost, status, kind, content):
 
 
 def emit(url, vhost, status, kind, content):
+  global _hits
+  _hits += 1
   if _out_q is not None:
     _out_q.put(('m', url, vhost, status, kind, content))
   else:
@@ -774,7 +785,8 @@ def stop_output_writer(timeout=None):
 
 def print_progress(total):
   pct = _scanned / total * 100 if total else 0.0
-  msg = f'wait bitch, scanning: {opts["hosts"]} ({_scanned}/{total} - {pct:.2f}%)'
+  msg = (f'wait bitch, scanning: {opts["hosts"]} | '
+         f'{_scanned}/{total} | {pct:.2f}% | {_hits} hits')
   if _out_q is not None:
     _out_q.put(('p', msg))
   else:
@@ -823,7 +835,7 @@ async def run_regex(loop, body, fn):
 
 
 async def probe(client, url, vhost, patterns, found, rdns=''):
-  pats, comb_s, comb_b, inv_s, inv_b = patterns
+  pats, comb_b, inv_s, inv_b = patterns
   label = vhost or rdns
 
   if found and found['hit']:
@@ -857,10 +869,12 @@ async def probe(client, url, vhost, patterns, found, rdns=''):
         for kb, vb in r.headers.raw:
           k = kb.decode('latin-1')
           v = vb.decode('latin-1')
-          if comb_s.search(k) or comb_s.search(v):   # one line per matched header
+          if any(sp.search(k) or sp.search(v) for sp, _ in pats):
             hmatches.append(safe_text(f'{k}: {v}'))
 
-      if hmatches and found is not None:
+      # under -1 a header hit can skip the body download, but only when there's
+      # no body-side -S (inv_b) still to check
+      if hmatches and found is not None and inv_b is None:
         for content in hmatches:
           emit(url, label, status, 'header', content)
         found['hit'] = True
@@ -1096,6 +1110,15 @@ def get_hosts(hosts):
           yield from parse_target(line, expand=True)
         except Exception as err:
           log(f'skipping bad target {line!r}: {str(err).lower()}', 'warn')
+  elif ',' in hosts and '://' not in hosts:   # comma-separated hosts (not a url)
+    for part in hosts.split(','):
+      part = part.strip()
+      if not part:
+        continue
+      try:
+        yield from parse_target(part, expand=True)
+      except Exception as err:
+        log(f'skipping bad target {part!r}: {str(err).lower()}', 'warn')
   else:
     try:
       yield from parse_target(hosts, expand=True)
@@ -1131,6 +1154,8 @@ def entry_targets(entry):
 
 def count_targets(hosts):
   if not os.path.isfile(hosts):
+    if ',' in hosts and '://' not in hosts:
+      return sum(entry_targets(p) for p in hosts.split(','))
     return entry_targets(hosts)
   total = 0
   try:

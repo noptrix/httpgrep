@@ -122,10 +122,10 @@ scan options
                       ranges, at the cost of ram and start-up buffering
   -W                - save/resume: on ctrl+c write progress to httpgrep.session;
                       rerun with -W to resume from it (else start fresh)
-  -T <0|1>          - pull (v)hosts from the TLS cert (CN + SAN) and scan them.
-                      0 = in-scope only (via host header on the scanned IP);
-                      1 = also scan each vhost by name (dns-resolved, MAY LEAVE
-                      the scanned scope). needs TLS (-t or a *443 port).
+  -T <0|1>          - also probe the cert (v)hosts (CN + SAN) as extra requests
+                      on top of the direct scan. 0 = via Host header on the
+                      same ip (in-scope); 1 = ALSO by dns name/SNI (may leave
+                      scope). needs TLS (https url, -t, or a *443 port).
 
 output options
 
