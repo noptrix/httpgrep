@@ -59,7 +59,7 @@ except ImportError:
 
 
 __author__ = 'noptrix'
-__version__ = '4.5'
+__version__ = '4.6'
 __copyright__ = 'Santa Clause'
 __license__ = 'MIT'
 
@@ -150,7 +150,8 @@ HELP = BOLD + '''usage''' + NORM + '''
                       line) to search given strings in, e.g.: /foobar/,
                       /foo.html, /admin,/login, /tmp/paths.txt (default: /)
   -r                - show the reverse-dns (PTR) name of scanned IPv4s as a
-                      label; the ip stays the scan target (no scope drift)
+                      label; the ip stays the scan target (no scope drift).
+                      non-blocking with the aiodns package
 
 ''' + BOLD + '''http options''' + NORM + '''
 
@@ -175,13 +176,14 @@ HELP = BOLD + '''usage''' + NORM + '''
 
 ''' + BOLD + '''search options''' + NORM + '''
 
-  -s <str|file>     - a single string/regex or multile strings/regex in a file
-                      to find in given URIs and HTTP response headers,
+  -s <str|file>     - a single string/regex or multiple strings/regex in a file
+                      to find in HTTP response bodies and headers (see -w),
                       e.g.: 'tomcat 8', '/tmp/igot0daysforthese.txt'
   -S <str|file>     - invert (grep -v): drop ALL matches of a response if this
                       string/regex (or file) appears anywhere in its body or
                       headers, e.g. to filter out dynamic error / 404 pages
-  -w <where>        - search strings in given places (default: headers,body)
+  -w <where>        - where to search: headers, body, or headers,body
+                      (default: headers,body)
   -b <bytes>        - num bytes of context to show from a body match
                       (default: 64)
   -m <size>         - max body to read + search; suffix b/kb/mb, no suffix = kb,
@@ -399,12 +401,6 @@ def log(msg='', _type='normal', esc='\n'):
   return
 
 
-def get_user_agent():
-  if opts['rand_agent']:
-    return random.choice(USER_AGENTS)
-  return opts['ua']
-
-
 def parse_kv(s):
   parsed = {}
   for item in s.split(';'):
@@ -534,12 +530,14 @@ async def cert_names(host, port):
       _, writer = await asyncio.wait_for(
         asyncio.open_connection(host, port, ssl=ctx, server_hostname=sni),
         timeout=opts['timeout'])
-      der = writer.get_extra_info('ssl_object').getpeercert(binary_form=True)
-      writer.close()
       try:
-        await writer.wait_closed()
-      except Exception:
-        pass
+        der = writer.get_extra_info('ssl_object').getpeercert(binary_form=True)
+      finally:
+        writer.close()
+        try:
+          await writer.wait_closed()
+        except Exception:
+          pass
     pem = ssl.DER_cert_to_PEM_cert(der)
     with tempfile.NamedTemporaryFile('w', suffix='.pem') as tf:
       tf.write(pem)
@@ -660,16 +658,34 @@ def compile_invert(spec, case):
   return inv_s, inv_b
 
 
-def req_headers(vhost=None):
-  h = {'User-Agent': get_user_agent()}
+_base_headers = None   # static part of the request headers, built once
+
+
+def _ascii_hdr(v):
+  # httpx rejects non-ascii header values; send them as latin-1 bytes
+  return v.encode('latin-1', 'replace') if isinstance(v, str) and not v.isascii() else v
+
+
+def _build_base_headers():
+  h = {}
+  if not opts['rand_agent']:
+    h['User-Agent'] = opts['ua']
   h.update(opts['headers'])
   if opts['cookies']:
     h['Cookie'] = '; '.join(f'{k}={v}' for k, v in opts['cookies'].items())
+  return {k: _ascii_hdr(v) for k, v in h.items()}
+
+
+def req_headers(vhost=None):
+  global _base_headers
+  if _base_headers is None:
+    _base_headers = _build_base_headers()
+  h = dict(_base_headers)
+  if opts['rand_agent']:
+    h['User-Agent'] = random.choice(USER_AGENTS)
   if vhost:
-    h['Host'] = vhost
-  # httpx rejects non-ascii header values; send them as latin-1 bytes
-  return {k: (v.encode('latin-1', 'replace') if isinstance(v, str)
-              and not v.isascii() else v) for k, v in h.items()}
+    h['Host'] = _ascii_hdr(vhost)
+  return h
 
 
 def write_log(path, line):
@@ -896,15 +912,17 @@ async def probe(client, url, vhost, patterns, found, rdns=''):
             await run_regex(loop, body, inv_b.search):
           return
 
+      snips = []
+      if 'body' in opts['where'] and body:   # runs before any emit -> a raise
+        snips = await run_regex(              # here can't double-emit on retry
+            loop, body, lambda b: match_body(b, pats, comb_b, opts['bytes']))
+
       for content in hmatches:
         emit(url, label, status, 'header', content)
         hit = True
-
-      if 'body' in opts['where'] and body:
-        for snip in await run_regex(
-            loop, body, lambda b: match_body(b, pats, comb_b, opts['bytes'])):
-          emit(url, label, status, 'body', snip)
-          hit = True
+      for snip in snips:
+        emit(url, label, status, 'body', snip)
+        hit = True
 
       if hit and found is not None:
         found['hit'] = True
@@ -924,6 +942,14 @@ async def probe(client, url, vhost, patterns, found, rdns=''):
     _sem.release()
 
 
+async def probe1(*args):
+  # like probe() but never propagates (matches gather(return_exceptions=True))
+  try:
+    return (await probe(*args)) is True
+  except Exception:
+    return False
+
+
 async def scan(client, host, ports, patterns, uris):
   rdns = ''
   if opts['rptr'] and ports is not None and is_ipv4(host):
@@ -939,18 +965,17 @@ async def scan(client, host, ports, patterns, uris):
     if parts.hostname and not await port_open(parts.hostname, pf_port):
       return False                  # unreachable -> not "done", retry on -W resume
     urls = url_targets(host, uris)
-    res = await asyncio.gather(*(probe(client, u, None, patterns, found)
-                                 for u in urls), return_exceptions=True)
-    ok = any(r is True for r in res)
+    ok = False
+    for u in urls:                 # one origin -> sequential so keepalive reuses
+      ok = await probe1(client, u, None, patterns, found) or ok
     if opts['vhost'] and parts.scheme == 'https' and parts.hostname:
       for vh in (v for v in await cert_names(parts.hostname, pf_port)
                  if v != parts.hostname):
-        tasks = [probe(client, u, vh, patterns, found) for u in urls]
+        for u in urls:             # in-scope: vhost via host header
+          await probe1(client, u, vh, patterns, found)
         if opts['vhost_dns']:      # -T 1: also hit the vhost by name
-          tasks += [probe(client, swap_host(u, vh), None, patterns, found)
-                    for u in urls]
-        r2 = await asyncio.gather(*tasks, return_exceptions=True)
-        ok = ok or any(r is True for r in r2)
+          for u in urls:
+            await probe1(client, swap_host(u, vh), None, patterns, found)
     return ok
 
   # ports of one host run concurrently; the global _sem caps connections
@@ -991,17 +1016,14 @@ async def scan_port(client, host, port, patterns, uris, found, rdns=''):
   if opts['vhost'] and scheme == 'https':
     vhosts = [vh for vh in await cert_names(host, port) if vh != host]
 
-  await asyncio.gather(*(probe(client, build_url(scheme, host, port, u), None,
-                               patterns, found, rdns) for u in uris),
-                       return_exceptions=True)
+  for u in uris:                   # one origin -> sequential so keepalive reuses
+    await probe1(client, build_url(scheme, host, port, u), None, patterns, found, rdns)
   for vh in vhosts:
-    # in-scope: vhost via host header on the scanned IP
-    tasks = [probe(client, build_url(scheme, host, port, u), vh, patterns, found)
-             for u in uris]
+    for u in uris:                 # in-scope: vhost via host header on the ip
+      await probe1(client, build_url(scheme, host, port, u), vh, patterns, found)
     if opts['vhost_dns']:
-      tasks += [probe(client, build_url(scheme, vh, port, u), None, patterns,
-                      found) for u in uris]
-    await asyncio.gather(*tasks, return_exceptions=True)
+      for u in uris:
+        await probe1(client, build_url(scheme, vh, port, u), None, patterns, found)
   return True
 
 
@@ -1266,9 +1288,9 @@ def parse_cmdline(cmdline):
       elif o == '-G':
         opts['gtimeout'] = float(a)
       elif o == '-f':
-        opts['filter_codes'] = [int(c) for c in a.split(',')]
+        opts['filter_codes'] = [int(c) for c in a.split(',') if c.strip()]
       elif o == '-e':
-        opts['exclude_codes'] = [int(c) for c in a.split(',')]
+        opts['exclude_codes'] = [int(c) for c in a.split(',') if c.strip()]
       elif o == '-i':
         opts['case_in'] = re.IGNORECASE
       elif o == '-I':
@@ -1338,6 +1360,15 @@ def check_fd_limit(concurrency):
     pass
 
 
+def quiet_reset_noise(loop, context):
+  # a peer resetting mid TLS-handshake leaves a ConnectionError on an orphaned
+  # uvloop future -> "exception never retrieved" spam; it's already handled in
+  # probe, so drop it. real errors still go to the default handler
+  if isinstance(context.get('exception'), (ConnectionError, ssl.SSLError)):
+    return
+  loop.default_exception_handler(context)
+
+
 async def run_scan(targets, patterns, uris, done, session_argv, total=0):
   n = opts['concurrency']
 
@@ -1351,6 +1382,7 @@ async def run_scan(targets, patterns, uris, done, session_argv, total=0):
       _resolver = None
 
   def abort(reason):
+    stop_progress()
     stop_output_writer(2)
     if opts['resume']:
       log(f'{reason}; saving session', 'warn')
@@ -1367,6 +1399,7 @@ async def run_scan(targets, patterns, uris, done, session_argv, total=0):
     os._exit(SUCCESS)
 
   loop = asyncio.get_running_loop()
+  loop.set_exception_handler(quiet_reset_noise)
   loop.add_signal_handler(signal.SIGINT, abort, 'you aborted me')
   if opts['gtimeout']:
     loop.call_later(opts['gtimeout'], abort,
@@ -1496,6 +1529,9 @@ def main(cmdline):
 
   if opts['window_cap'] < 1:
     log('shuffle window cap (-Z) must be >= 1', 'error')
+
+  if opts['shuffle_bytes'] < 0:
+    log('shuffle size (-z) must be >= 0', 'error')
 
   if opts['maxbody'] < 1:
     log('max body (-m) must be >= 1', 'error')
