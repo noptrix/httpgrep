@@ -59,7 +59,7 @@ except ImportError:
 
 
 __author__ = 'noptrix'
-__version__ = '4.6'
+__version__ = '4.7'
 __copyright__ = 'Santa Clause'
 __license__ = 'MIT'
 
@@ -96,6 +96,8 @@ VERBOSE_QMAX = 10000
 
 PROGRESS_EVERY = 5.0
 
+UV_POOL_MAX = 1024
+
 # cap the tcp preflight: a filtered ip (syn dropped) must not hold a concurrency
 # slot for the whole -c read timeout, or dead range blocks starve live hosts
 CONNECT_TIMEOUT = 2.0
@@ -107,6 +109,8 @@ SO_LINGER_RST = (socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
 _resolver = None
 _dns_cache = {}
 DNS_CACHE_MAX = 500000
+_vhost_seen = set()
+VHOST_SEEN_MAX = 500000
 _sem = None
 
 NORM = '\033[0m'
@@ -127,7 +131,7 @@ BANNER = BLUE + r'''    __    __  __
 
 HELP = BOLD + '''usage''' + NORM + '''
 
-  httpgrep -h <args> -s <arg> [opts] | <misc>
+  httpgrep -h <arg> -s <arg> [opts] | <misc>
 
 ''' + BOLD + '''target options''' + NORM + '''
 
@@ -499,6 +503,29 @@ def is_ipv4(host):
     return False
 
 
+def vhost_first_time(name, port):
+  key = f'{name}:{port}'
+  if key in _vhost_seen:
+    return False
+  if len(_vhost_seen) >= VHOST_SEEN_MAX:
+    _vhost_seen.clear()
+  _vhost_seen.add(key)
+  return True
+
+
+def resolvable_vhost(name):
+  if '.' not in name or any(c.isspace() for c in name):
+    return False
+  if name.lower().rstrip('.') in ('localhost', 'localhost.localdomain'):
+    return False
+  try:
+    ip = ipaddress.ip_address(name)
+  except ValueError:
+    return True
+  return not (ip.is_private or ip.is_loopback or ip.is_reserved
+              or ip.is_link_local or ip.is_multicast or ip.is_unspecified)
+
+
 async def port_open(host, port):
   try:
     async with _sem:
@@ -555,7 +582,8 @@ async def cert_names(host, port):
       names.add(val)
 
   # drop wildcards (not usable as a literal host), empties, control chars
-  return {n for n in names if n and '*' not in n and n.isprintable()}
+  return {n for n in names if n and '*' not in n and n.isprintable()
+          and not any(c.isspace() for c in n)}
 
 
 def get_uris():
@@ -973,7 +1001,8 @@ async def scan(client, host, ports, patterns, uris):
                  if v != parts.hostname):
         for u in urls:             # in-scope: vhost via host header
           await probe1(client, u, vh, patterns, found)
-        if opts['vhost_dns']:      # -T 1: also hit the vhost by name
+        if opts['vhost_dns'] and resolvable_vhost(vh) \
+            and vhost_first_time(vh, pf_port):           # -T 1: also by name
           for u in urls:
             await probe1(client, swap_host(u, vh), None, patterns, found)
     return ok
@@ -1021,7 +1050,7 @@ async def scan_port(client, host, port, patterns, uris, found, rdns=''):
   for vh in vhosts:
     for u in uris:                 # in-scope: vhost via host header on the ip
       await probe1(client, build_url(scheme, host, port, u), vh, patterns, found)
-    if opts['vhost_dns']:
+    if opts['vhost_dns'] and resolvable_vhost(vh) and vhost_first_time(vh, port):
       for u in uris:
         await probe1(client, build_url(scheme, vh, port, u), None, patterns, found)
   return True
@@ -1570,6 +1599,11 @@ def main(cmdline):
     log(f'wait bitch, scanning: {opts["hosts"]}', 'info')
 
   targets = get_hosts(opts['hosts'])
+
+  # libuv only takes its dns threadpool size from the env, and it must be set
+  # before the first lookup; too small starves -T 1 on slow dns
+  os.environ.setdefault('UV_THREADPOOL_SIZE',
+                        str(min(max(opts['concurrency'], 4), UV_POOL_MAX)))
 
   asyncio.run(run_scan(targets, patterns, uris, done, session_argv, total),
               loop_factory=uvloop.new_event_loop if uvloop else None)
