@@ -59,7 +59,7 @@ except ImportError:
 
 
 __author__ = 'noptrix'
-__version__ = '4.7'
+__version__ = '4.8'
 __copyright__ = 'Santa Clause'
 __license__ = 'MIT'
 
@@ -913,10 +913,9 @@ async def probe(client, url, vhost, patterns, found, rdns=''):
       hmatches = []
       if 'headers' in opts['where']:
         for kb, vb in r.headers.raw:
-          k = kb.decode('latin-1')
-          v = vb.decode('latin-1')
-          if any(sp.search(k) or sp.search(v) for sp, _ in pats):
-            hmatches.append(safe_text(f'{k}: {v}'))
+          line = f'{kb.decode("latin-1")}: {vb.decode("latin-1")}'
+          if any(sp.search(line) for sp, _ in pats):
+            hmatches.append(safe_text(line))
 
       # under -1 a header hit can skip the body download, but only when there's
       # no body-side -S (inv_b) still to check
